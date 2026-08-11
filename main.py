@@ -58,7 +58,7 @@ def make_session():
     )
     s.mount("https://", HTTPAdapter(max_retries=retry))
     s.headers.update({
-        "User-Agent": "Mozilla/5.0 (PingRiverImageCenter/8.0)",
+        "User-Agent": "Mozilla/5.0 (PingRiverImageCenter/9.0)",
         "Accept": "*/*",
         "Referer": "https://appserv.net/pingriver.php",
     })
@@ -894,6 +894,17 @@ def latest_png(station: str):
 
 
 def build_slot_tasks(station: str, hours: int, step: int):
+    """
+    v9:
+    ไม่ยึด now เป็นปลายช่วง เพราะไฟล์ hourly ของ AppServ อาจ lag 1-2 ชั่วโมง
+    ให้ยึด "ไฟล์ Playback ล่าสุดที่มีจริง" เป็นปลายช่วงแทน
+
+    ตัวอย่าง:
+      ตอนนี้ 13:04
+      newest file = hourly/2026-08-11_11.mp4
+      ไฟล์นี้แทน 11:00-12:00
+      hours=1 => สุ่มเฟรมใน 11:00-12:00
+    """
     cam = fetch_camlist(station)
     exp = cam.get("exp")
     sig = cam.get("sig")
@@ -917,20 +928,38 @@ def build_slot_tasks(station: str, hours: int, step: int):
     cam["exp"] = exp
     cam["sig"] = sig
 
+    # map เฉพาะไฟล์ที่มีจริง
     file_map = {}
+    available_hours = []
     for rel in cam["files"]:
         dt = parse_hourly_filename(rel)
         if dt:
             file_map[dt] = rel
+            available_hours.append(dt)
 
-    n = now_bkk()
-    start = n - timedelta(hours=hours)
-    start = start.replace(minute=0, second=0, microsecond=0)
+    if not available_hours:
+        return [], cam
+
+    available_hours.sort()
+
+    # newest_hour คือเวลาเริ่มต้นของไฟล์ล่าสุดที่มีจริง
+    newest_hour = available_hours[-1]
+
+    # end_boundary คือเวลาสิ้นสุดของไฟล์ล่าสุด
+    # เช่น 11.mp4 => 12:00
+    end_boundary = newest_hour + timedelta(hours=1)
+
+    # ขอย้อนหลัง N ชั่วโมง โดย anchor ที่ playback ล่าสุด
+    start_boundary = end_boundary - timedelta(hours=hours)
+
     tasks = []
-    cursor = start
-    while cursor <= n:
+    cursor = start_boundary
+
+    # slot ต้องอยู่ก่อน end_boundary เท่านั้น
+    while cursor < end_boundary:
         hour_dt = cursor.replace(minute=0, second=0, microsecond=0)
         rel = file_map.get(hour_dt)
+
         if rel:
             offset = int((cursor - hour_dt).total_seconds())
             tasks.append({
@@ -938,10 +967,17 @@ def build_slot_tasks(station: str, hours: int, step: int):
                 "slot": cursor,
                 "rel_file": rel,
                 "offset": offset,
-                "urls": playback_url_candidates(station, rel, exp=exp, sig=sig),
+                "urls": playback_url_candidates(
+                    station,
+                    rel,
+                    exp=exp,
+                    sig=sig,
+                ),
             })
+
         cursor += timedelta(minutes=step)
 
+    # unique
     uniq = []
     seen = set()
     for t in tasks:
@@ -949,8 +985,13 @@ def build_slot_tasks(station: str, hours: int, step: int):
         if key not in seen:
             seen.add(key)
             uniq.append(t)
-    return uniq, cam
 
+    cam["latest_available_hour"] = newest_hour.isoformat()
+    cam["playback_end_boundary"] = end_boundary.isoformat()
+    cam["requested_start_boundary"] = start_boundary.isoformat()
+    cam["task_count"] = len(uniq)
+
+    return uniq, cam
 
 def extract_task_frame(task):
     b = ffmpeg_extract_frame(task["urls"], task["offset"], task["station"])
@@ -1090,7 +1131,7 @@ HTML = """
 <head>
 <meta charset=\"utf-8\">
 <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">
-<title>Ping River Image Center v8</title>
+<title>Ping River Image Center v9</title>
 <style>
 :root{color-scheme:dark}
 *{box-sizing:border-box}
@@ -1114,7 +1155,7 @@ select{background:#0a1728;color:white;border:1px solid #36506c;padding:9px;borde
 </head>
 <body>
 <div class=\"wrap\">
-  <h1>🌊 Ping River Image Center v8</h1>
+  <h1>🌊 Ping River Image Center v9</h1>
   <div class=\"sub\">เวอร์ชันนี้ใช้ CCTV Playback แบบวิดีโอรายชั่วโมงเพื่อสร้าง GIF จากภาพจริงย้อนหลัง</div>
 
   <div class=\"grid\">
@@ -1290,17 +1331,38 @@ def history_check(station: str = Query(...), hours: int = Query(24, ge=1, le=72)
     station = validate_station(station)
     try:
         cam = fetch_camlist(station)
-        cutoff = now_bkk() - timedelta(hours=hours)
         dts = [parse_hourly_filename(x) for x in cam["files"]]
-        dts = [x for x in dts if x]
-        in_period = [x for x in dts if x >= cutoff.replace(minute=0, second=0, microsecond=0)]
+        dts = sorted([x for x in dts if x])
+
+        if not dts:
+            return {
+                "station": station,
+                "hours": hours,
+                "total_files": 0,
+                "in_period": 0,
+                "first": None,
+                "last": None,
+            }
+
+        latest = dts[-1]
+        end_boundary = latest + timedelta(hours=1)
+        cutoff = end_boundary - timedelta(hours=hours)
+
+        in_period = [
+            x for x in dts
+            if cutoff <= x < end_boundary
+        ]
+
         return {
             "station": station,
             "hours": hours,
             "total_files": len(dts),
             "in_period": len(in_period),
-            "first": dts[0].isoformat() if dts else None,
-            "last": dts[-1].isoformat() if dts else None,
+            "first": dts[0].isoformat(),
+            "last": dts[-1].isoformat(),
+            "latest_available_hour": latest.isoformat(),
+            "playback_end_boundary": end_boundary.isoformat(),
+            "requested_start_boundary": cutoff.isoformat(),
             "sig_present": bool(cam.get("sig")),
             "exp": cam.get("exp"),
         }
@@ -1312,10 +1374,19 @@ def history_check(station: str = Query(...), hours: int = Query(24, ge=1, le=72)
 def api_debug_video_probe(station: str = Query(...)):
     station = validate_station(station)
     tasks, cam = build_slot_tasks(station, hours=1, step=30)
-    if not tasks:
-        raise HTTPException(502, "ไม่มี task สำหรับทดสอบ")
 
-    # เลือกไฟล์แรกที่มี
+    if not tasks:
+        raise HTTPException(
+            502,
+            {
+                "message": "ไม่มี task สำหรับทดสอบ",
+                "latest_available_hour": cam.get("latest_available_hour"),
+                "playback_end_boundary": cam.get("playback_end_boundary"),
+                "requested_start_boundary": cam.get("requested_start_boundary"),
+                "files": len(cam.get("files", [])),
+            },
+        )
+
     task = tasks[0]
     video_path = None
     try:
@@ -1347,6 +1418,8 @@ def api_debug_video_probe(station: str = Query(...)):
 
         return {
             "station": station,
+            "latest_available_hour": cam.get("latest_available_hour"),
+            "playback_end_boundary": cam.get("playback_end_boundary"),
             "file": task["rel_file"],
             "size_bytes": size_bytes,
             "duration_seconds": duration,
@@ -1355,6 +1428,7 @@ def api_debug_video_probe(station: str = Query(...)):
     finally:
         if video_path:
             remove_file(video_path)
+
 
 
 @app.get("/api/debug/playback-url-sample")
