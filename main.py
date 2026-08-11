@@ -58,7 +58,7 @@ def make_session():
     )
     s.mount("https://", HTTPAdapter(max_retries=retry))
     s.headers.update({
-        "User-Agent": "Mozilla/5.0 (PingRiverImageCenter/5.0)",
+        "User-Agent": "Mozilla/5.0 (PingRiverImageCenter/6.0)",
         "Accept": "*/*",
         "Referer": "https://appserv.net/pingriver.php",
     })
@@ -322,6 +322,37 @@ def debug_latest_sources(station: str):
             }
     return result
 
+def _recursive_find_auth(obj):
+    """
+    หา exp/sig ไม่ว่าจะอยู่ top-level, auth, data.auth หรือ nested object อื่น
+    """
+    if isinstance(obj, dict):
+        exp = obj.get("exp")
+        sig = obj.get("sig")
+        if exp is not None and sig:
+            return str(exp), str(sig), "nested"
+
+        auth = obj.get("auth")
+        if isinstance(auth, dict):
+            exp = auth.get("exp")
+            sig = auth.get("sig")
+            if exp is not None and sig:
+                return str(exp), str(sig), "auth"
+
+        for value in obj.values():
+            found = _recursive_find_auth(value)
+            if found:
+                return found
+
+    elif isinstance(obj, list):
+        for value in obj:
+            found = _recursive_find_auth(value)
+            if found:
+                return found
+
+    return None
+
+
 def parse_camlist_response(raw: str):
     obj = None
     try:
@@ -332,40 +363,109 @@ def parse_camlist_response(raw: str):
     files = []
     exp = None
     sig = None
+    auth_shape = None
+
     if isinstance(obj, dict):
         if isinstance(obj.get("files"), list):
             files = [str(x) for x in obj.get("files", [])]
-        exp = obj.get("exp")
-        sig = obj.get("sig")
+
+        found = _recursive_find_auth(obj)
+        if found:
+            exp, sig, auth_shape = found
 
     if not files:
         files = re.findall(r'hourly/\d{4}-\d{2}-\d{2}_\d{2}\.mp4', raw)
 
+    # regex fallback เผื่อ response ไม่ใช่ JSON สมบูรณ์
     if exp is None:
         m = re.search(r'"exp"\s*:\s*"?(?P<v>\d+)"?', raw)
         if m:
             exp = m.group("v")
+            auth_shape = auth_shape or "regex"
     if sig is None:
         m = re.search(r'"sig"\s*:\s*"(?P<v>[a-fA-F0-9]+)"', raw)
         if m:
             sig = m.group("v")
+            auth_shape = auth_shape or "regex"
 
     files = list(dict.fromkeys(files))
     return {
         "files": files,
         "exp": exp,
         "sig": sig,
-        "raw_preview": raw[:2000]
+        "auth_shape": auth_shape,
+        "raw_preview": raw[:2000],
+        "raw_tail": raw[-1500:],
+    }
+
+
+def _prime_appserv_session(station: str):
+    """
+    Browser เปิดหน้า pingriver.php ก่อน แล้ว JS จึง fetch camlist ใน same-origin
+    ทำแบบเดียวกันเพื่อรับ Set-Cookie/session ก่อน
+    """
+    nonce = int(now_bkk().timestamp() * 1000)
+    url = f"{APP_BASE}?station={station}&_={nonce}"
+    r = HTTP.get(url, timeout=HTTP_TIMEOUT)
+    r.raise_for_status()
+    return {
+        "status": r.status_code,
+        "cookie_names": [c.name for c in HTTP.cookies],
     }
 
 
 def fetch_camlist(station: str):
-    raw = fetch_text(f"{APP_BASE}?op=camlist&station={station}&_={int(now_bkk().timestamp()*1000)}")
-    parsed = parse_camlist_response(raw)
+    nonce = int(now_bkk().timestamp() * 1000)
+
+    # Prime session เหมือน browser
+    prime_info = None
+    try:
+        prime_info = _prime_appserv_session(station)
+    except Exception as e:
+        prime_info = {"error": str(e), "cookie_names": [c.name for c in HTTP.cookies]}
+
+    url = f"{APP_BASE}?op=camlist&station={station}&_={nonce}"
+    r = HTTP.get(
+        url,
+        timeout=HTTP_TIMEOUT,
+        headers={
+            "Referer": f"{APP_BASE}?station={station}",
+            "Accept": "application/json, text/plain, */*",
+        },
+    )
+    r.raise_for_status()
+    if not r.encoding or r.encoding.lower() == "iso-8859-1":
+        r.encoding = r.apparent_encoding or "utf-8"
+
+    parsed = parse_camlist_response(r.text)
+    parsed["prime_info"] = prime_info
+    parsed["cookie_names"] = [c.name for c in HTTP.cookies]
+
+    # ถ้า auth ยังไม่มา ลอง prime + camlist ใหม่อีกครั้ง
+    if parsed["files"] and not (parsed.get("exp") and parsed.get("sig")):
+        try:
+            _prime_appserv_session(station)
+            r2 = HTTP.get(
+                url + "&retry=1",
+                timeout=HTTP_TIMEOUT,
+                headers={
+                    "Referer": f"{APP_BASE}?station={station}",
+                    "Accept": "application/json, text/plain, */*",
+                    "Cache-Control": "no-cache",
+                },
+            )
+            r2.raise_for_status()
+            parsed2 = parse_camlist_response(r2.text)
+            parsed2["prime_info"] = prime_info
+            parsed2["cookie_names"] = [c.name for c in HTTP.cookies]
+            if parsed2.get("exp") and parsed2.get("sig"):
+                parsed = parsed2
+        except Exception:
+            pass
+
     if not parsed["files"]:
         raise RuntimeError(f"ไม่พบไฟล์ playback ของ {station}")
     return parsed
-
 
 def try_discover_sig_from_page(station: str):
     html = fetch_text(f"{APP_BASE}?station={station}&_={int(now_bkk().timestamp()*1000)}")
@@ -387,14 +487,35 @@ def playback_url_candidates(station: str, rel_file: str, exp=None, sig=None):
     return urls
 
 
+def _ffmpeg_http_headers():
+    headers = [
+        "Referer: https://appserv.net/pingriver.php",
+        "Origin: https://appserv.net",
+        "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36",
+    ]
+    if HTTP.cookies:
+        cookie_text = "; ".join(f"{c.name}={c.value}" for c in HTTP.cookies)
+        if cookie_text:
+            headers.append("Cookie: " + cookie_text)
+    return "\r\n".join(headers) + "\r\n"
+
+
 def ffmpeg_extract_frame(urls, offset_seconds: int):
+    """
+    ใช้ signed URL จาก camlist และส่ง Referer/Origin/Cookie แบบ browser
+    """
     last_err = None
+    http_headers = _ffmpeg_http_headers()
+
     for url in urls:
         cmd = [
             "ffmpeg",
             "-hide_banner",
             "-loglevel", "error",
             "-y",
+            "-user_agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36",
+            "-headers", http_headers,
             "-ss", str(int(offset_seconds)),
             "-i", url,
             "-frames:v", "1",
@@ -403,14 +524,19 @@ def ffmpeg_extract_frame(urls, offset_seconds: int):
             "pipe:1",
         ]
         try:
-            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+            res = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=120,
+            )
             if res.returncode == 0 and res.stdout:
                 return res.stdout
-            last_err = res.stderr.decode("utf-8", "ignore")[:500]
+            last_err = res.stderr.decode("utf-8", "ignore")[:800]
         except Exception as e:
             last_err = str(e)
-    raise RuntimeError(last_err or "ffmpeg ดึงเฟรมไม่สำเร็จ")
 
+    raise RuntimeError(last_err or "ffmpeg ดึงเฟรมไม่สำเร็จ")
 
 def _parse_meter(cell: str):
     m = re.search(r'([+-]?\d+(?:\.\d+)?)\s*(?:m\b|เมตร)', cell, re.I)
@@ -574,7 +700,7 @@ def build_slot_tasks(station: str, hours: int, step: int):
     cam = fetch_camlist(station)
     exp = cam.get("exp")
     sig = cam.get("sig")
-    auth_source = "camlist"
+    auth_source = "camlist" if (exp and sig) else None
 
     if not (exp and sig):
         discovered_exp, discovered_sig = try_discover_sig_from_page(station)
@@ -728,7 +854,7 @@ HTML = """
 <head>
 <meta charset=\"utf-8\">
 <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">
-<title>Ping River Image Center v2</title>
+<title>Ping River Image Center v6</title>
 <style>
 :root{color-scheme:dark}
 *{box-sizing:border-box}
@@ -752,7 +878,7 @@ select{background:#0a1728;color:white;border:1px solid #36506c;padding:9px;borde
 </head>
 <body>
 <div class=\"wrap\">
-  <h1>🌊 Ping River Image Center v2</h1>
+  <h1>🌊 Ping River Image Center v6</h1>
   <div class=\"sub\">เวอร์ชันนี้ใช้ CCTV Playback แบบวิดีโอรายชั่วโมงเพื่อสร้าง GIF จากภาพจริงย้อนหลัง</div>
 
   <div class=\"grid\">
@@ -946,6 +1072,26 @@ def history_check(station: str = Query(...), hours: int = Query(24, ge=1, le=72)
         raise HTTPException(502, f"ตรวจ playback ไม่สำเร็จ: {e}")
 
 
+@app.get("/api/debug/session-camlist")
+def api_debug_session_camlist(station: str = Query(...)):
+    station = validate_station(station)
+    try:
+        cam = fetch_camlist(station)
+        return {
+            "station": station,
+            "files": len(cam.get("files", [])),
+            "has_exp": bool(cam.get("exp")),
+            "has_sig": bool(cam.get("sig")),
+            "exp": cam.get("exp"),
+            "auth_shape": cam.get("auth_shape"),
+            "cookie_names": cam.get("cookie_names", []),
+            "prime_info": cam.get("prime_info"),
+            "raw_tail": cam.get("raw_tail", "")[-900:],
+        }
+    except Exception as e:
+        raise HTTPException(502, str(e))
+
+
 @app.get("/api/debug/playback-auth")
 def api_debug_playback_auth(station: str = Query(...)):
     station = validate_station(station)
@@ -989,6 +1135,8 @@ def debug_camlist(station: str = Query(...)):
             "sample_files": cam["files"][:10],
             "exp_from_camlist": cam.get("exp"),
             "sig_from_camlist": bool(cam.get("sig")),
+            "auth_shape": cam.get("auth_shape"),
+            "cookie_names": cam.get("cookie_names", []),
             "exp_from_page": exp2,
             "sig_from_page": bool(sig2),
             "exp_from_env": env_exp,

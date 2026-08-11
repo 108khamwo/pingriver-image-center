@@ -1,4 +1,4 @@
-# Ping River Image Center v5
+# Ping River Image Center v6
 
 เวอร์ชันนี้อัปเดตให้ใช้ CCTV Playback แบบวิดีโอรายชั่วโมง (`hourly/*.mp4`) เพื่อสร้าง GIF จากภาพจริงย้อนหลัง
 
@@ -51,3 +51,17 @@
   - หรือ `PLAYBACK_P1_EXP` / `PLAYBACK_P1_SIG`, `PLAYBACK_P67_EXP` / `PLAYBACK_P67_SIG`
 - เพิ่ม `/api/debug/playback-auth?station=P.67`
 - ถ้า AppServ ไม่ส่ง `exp/sig` มาเอง ระบบจะ fallback ไปใช้ค่าจาก env
+
+
+## แก้ไข v6 — automatic AppServ session
+จาก JavaScript ต้นทาง `DvdPlayer.auth` มาจาก camlist
+v6 จึง:
+1. เปิดหน้า station ก่อนเพื่อรับ session/cookie
+2. เรียก camlist ด้วย requests.Session เดิม
+3. หา exp/sig ทั้ง top-level และ nested `auth`
+4. ส่ง Referer, Origin, User-Agent และ Cookie เดิมให้ ffmpeg
+5. Environment Variables ของ v5 ยังใช้เป็น fallback ได้
+
+Debug:
+- `/api/debug/session-camlist?station=P.1`
+- `/api/debug/session-camlist?station=P.67`
