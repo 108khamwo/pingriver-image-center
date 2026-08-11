@@ -1,4 +1,4 @@
-# Ping River Image Center v3
+# Ping River Image Center v4
 
 เวอร์ชันนี้อัปเดตให้ใช้ CCTV Playback แบบวิดีโอรายชั่วโมง (`hourly/*.mp4`) เพื่อสร้าง GIF จากภาพจริงย้อนหลัง
 
@@ -33,3 +33,11 @@
 - ถ้า camlist ไม่มี JPG ล่าสุด จะ fallback ไปอ่านหน้า `pingriver.php?station=P.x`
 - Playback error จะไม่ทำให้ status ทั้งหมดล้ม
 - เพิ่ม `/api/debug/latest?station=P.67`
+
+
+## แก้ไข v4
+- คืน extractor แบบ v1 ที่เคยจับ CCTV P.67 ได้
+- รองรับกรณี AppServ ส่งมาแค่ชื่อไฟล์ `cctv_YYYYMMDDHHMMSS_hash.jpg`
+- ประกอบ `/cache/P.x/YYYY/MM/<filename>` อัตโนมัติ
+- ตรวจ 3 source: `op=camlist`, หน้า station และ `ajax_data_only`
+- เพิ่ม `/api/debug/latest-sources?station=P.67`

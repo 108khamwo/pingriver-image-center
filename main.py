@@ -58,7 +58,7 @@ def make_session():
     )
     s.mount("https://", HTTPAdapter(max_retries=retry))
     s.headers.update({
-        "User-Agent": "Mozilla/5.0 (PingRiverImageCenter/2.0)",
+        "User-Agent": "Mozilla/5.0 (PingRiverImageCenter/4.0)",
         "Accept": "*/*",
         "Referer": "https://appserv.net/pingriver.php",
     })
@@ -136,28 +136,81 @@ def parse_hourly_filename(name: str):
         return None
 
 
-def _extract_cache_jpgs(raw: str, station: str):
-    pattern = rf"((?:https?://appserv\.net)?/cache/{re.escape(station)}/[^\s\"'<>]+?\.jpe?g(?:\?[^\s\"'<>]*)?)"
-    urls = re.findall(pattern, raw, re.I)
+def _collect_strings(obj):
+    out = []
+    if isinstance(obj, str):
+        out.append(obj)
+    elif isinstance(obj, dict):
+        for k, v in obj.items():
+            out.extend(_collect_strings(k))
+            out.extend(_collect_strings(v))
+    elif isinstance(obj, (list, tuple)):
+        for x in obj:
+            out.extend(_collect_strings(x))
+    return out
 
+
+def _extract_cache_jpgs(raw: str, station: str):
+    """
+    v4: คืน logic แบบ v1 ที่เคยจับ P.67 ได้
+    รองรับ:
+      1) URL เต็ม https://appserv.net/cache/P.67/...jpg
+      2) relative /cache/P.67/...jpg
+      3) JSON/HTML ที่มีเพียงชื่อไฟล์ cctv_YYYYMMDDHHMMSS_hash.jpg
+         แล้วประกอบ path จาก timestamp ในชื่อไฟล์
+    """
+    strings = [raw]
+
+    # JSON response อาจซ่อนชื่อไฟล์อยู่ใน key/value
+    try:
+        strings.extend(_collect_strings(json.loads(raw)))
+    except Exception:
+        pass
+
+    # HTML attributes
     try:
         soup = BeautifulSoup(raw, "html.parser")
         for tag in soup.find_all(["img", "a", "source"]):
             for attr in ("src", "href"):
                 value = tag.get(attr)
-                if value and f"/cache/{station}/" in value and re.search(r"\.jpe?g(?:\?|$)", value, re.I):
-                    urls.append(value)
+                if value:
+                    strings.append(value)
     except Exception:
         pass
 
+    blob = "\n".join(strings)
+    found = []
+
+    # full / relative cache path
+    pattern = rf"((?:https?://appserv\.net)?/cache/{re.escape(station)}/[^\s\"'<>\\]+?\.jpe?g(?:\?[^\s\"'<>\\]*)?)"
+    found.extend(re.findall(pattern, blob, re.I))
+
+    # สำคัญ: บาง response/page มีแค่ชื่อไฟล์ ไม่มี /cache/P.x/
+    filenames = re.findall(
+        r"(cctv_(\d{14})_[A-Za-z0-9]+\.jpe?g)",
+        blob,
+        re.I,
+    )
+    for filename, stamp in filenames:
+        try:
+            dt = datetime.strptime(stamp, "%Y%m%d%H%M%S").replace(tzinfo=BKK)
+            found.append(
+                f"{APP_ORIGIN}/cache/{station}/{dt:%Y}/{dt:%m}/{filename}"
+            )
+        except ValueError:
+            pass
+
     clean = []
-    for u in urls:
+    seen = set()
+    for u in found:
         u = u.replace("\\/", "/").replace("&amp;", "&").strip()
         if u.startswith("/"):
             u = APP_ORIGIN + u
-        clean.append(u.split("?")[0])
+        base = u.split("?")[0]
+        if base not in seen:
+            seen.add(base)
+            clean.append(base)
 
-    clean = list(dict.fromkeys(clean))
     clean.sort(
         key=lambda x: camera_timestamp_from_cache_url(x)
         or datetime(2000, 1, 1, tzinfo=BKK)
@@ -166,22 +219,69 @@ def _extract_cache_jpgs(raw: str, station: str):
 
 
 def latest_cache_jpg(station: str):
-    # camlist รุ่นปัจจุบันเน้นคืนรายชื่อ MP4 จึงอาจไม่มี JPG ล่าสุด
-    raw = fetch_text(
-        f"{APP_BASE}?op=camlist&station={station}&_={int(now_bkk().timestamp()*1000)}"
+    """
+    ลอง 3 source ตาม request ที่ browser ของ AppServ ใช้จริง:
+      camlist -> page -> ajax_data_only
+    """
+    nonce = int(now_bkk().timestamp() * 1000)
+    sources = [
+        ("camlist", f"{APP_BASE}?op=camlist&station={station}&_={nonce}"),
+        ("page", f"{APP_BASE}?station={station}&_={nonce}"),
+        ("ajax", f"{APP_BASE}?ajax_data_only=true&station={station}&_={nonce}"),
+    ]
+
+    all_found = []
+    errors = {}
+    for name, url in sources:
+        try:
+            raw = fetch_text(url)
+            found = _extract_cache_jpgs(raw, station)
+            all_found.extend(found)
+        except Exception as e:
+            errors[name] = str(e)
+
+    all_found = list(dict.fromkeys(all_found))
+    all_found.sort(
+        key=lambda x: camera_timestamp_from_cache_url(x)
+        or datetime(2000, 1, 1, tzinfo=BKK)
     )
-    clean = _extract_cache_jpgs(raw, station)
 
-    # fallback เหมือน v1: อ่านหน้า station เพื่อหา <img src="/cache/P.x/...jpg">
-    if not clean:
-        page = fetch_text(
-            f"{APP_BASE}?station={station}&_={int(now_bkk().timestamp()*1000)}"
+    if not all_found:
+        detail = "; ".join(f"{k}:{v}" for k, v in errors.items())
+        raise RuntimeError(
+            f"ไม่พบภาพล่าสุดของ {station}"
+            + (f" ({detail})" if detail else "")
         )
-        clean = _extract_cache_jpgs(page, station)
+    return all_found[-1], all_found
 
-    if not clean:
-        raise RuntimeError(f"ไม่พบภาพล่าสุดของ {station}")
-    return clean[-1], clean
+
+def debug_latest_sources(station: str):
+    nonce = int(now_bkk().timestamp() * 1000)
+    sources = [
+        ("camlist", f"{APP_BASE}?op=camlist&station={station}&_={nonce}"),
+        ("page", f"{APP_BASE}?station={station}&_={nonce}"),
+        ("ajax", f"{APP_BASE}?ajax_data_only=true&station={station}&_={nonce}"),
+    ]
+    result = {"station": station, "sources": {}}
+    for name, url in sources:
+        try:
+            raw = fetch_text(url)
+            found = _extract_cache_jpgs(raw, station)
+            names = re.findall(r"cctv_\d{14}_[A-Za-z0-9]+\.jpe?g", raw, re.I)
+            result["sources"][name] = {
+                "ok": True,
+                "found_count": len(found),
+                "found": found[-5:],
+                "filename_only_count": len(set(names)),
+                "filename_only": list(dict.fromkeys(names))[-5:],
+                "preview": raw[:700],
+            }
+        except Exception as e:
+            result["sources"][name] = {
+                "ok": False,
+                "error": str(e),
+            }
+    return result
 
 def parse_camlist_response(raw: str):
     obj = None
@@ -810,6 +910,12 @@ def debug_camlist(station: str = Query(...)):
         }
     except Exception as e:
         raise HTTPException(502, str(e))
+
+
+@app.get("/api/debug/latest-sources")
+def api_debug_latest_sources(station: str = Query(...)):
+    station = validate_station(station)
+    return debug_latest_sources(station)
 
 
 @app.get("/api/debug/latest")
