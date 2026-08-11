@@ -64,7 +64,7 @@ def make_session():
     )
     s.mount("https://", HTTPAdapter(max_retries=retry))
     s.headers.update({
-        "User-Agent": "Mozilla/5.0 (PingRiverImageCenter/23.0)",
+        "User-Agent": "Mozilla/5.0 (PingRiverImageCenter/24.0)",
         "Accept": "*/*",
         "Referer": "https://appserv.net/pingriver.php",
     })
@@ -1052,13 +1052,22 @@ def playback_hour_water_level(history, slot_dt):
     return nearest_water_level(history, display_dt), display_dt
 
 
-def render_report_frame(cctv_bytes: bytes, station: str, captured_at: datetime, water_level, size: int, water_level_dt=None):
+def build_overall_period_text(slots):
+    if not slots:
+        return "-"
+    first_slot = min(slots).astimezone(BKK).replace(minute=0, second=0, microsecond=0)
+    last_slot = max(slots).astimezone(BKK).replace(minute=0, second=0, microsecond=0)
+    end_dt = last_slot + timedelta(minutes=59)
+    return f"{first_slot.strftime('%d/%m/%Y %H:%M')} - {end_dt.strftime('%d/%m/%Y %H:%M')} น."
+
+
+def render_report_frame(cctv_bytes: bytes, station: str, captured_at: datetime, water_level, size: int, water_level_dt=None, fixed_period_text=None, zoom_timestamp=True):
     # ปรับโทนโดยรวมให้เป็นสีฟ้ามากขึ้น
     canvas = Image.new("RGB", (size, size), (10, 32, 60))
     draw = ImageDraw.Draw(canvas)
 
     margin = int(size * 0.032)
-    header_h = int(size * 0.175)   # ส่วนหัวใหญ่ขึ้นอีกและจัดกึ่งกลาง
+    header_h = int(size * 0.175)
     footer_h = int(size * 0.24)
 
     title_text = f"{station}  {STATIONS[station]}"
@@ -1072,7 +1081,6 @@ def render_report_frame(cctv_bytes: bytes, station: str, captured_at: datetime, 
     )
     label_font = get_font(max(21, int(size * 0.032)), True)
     value_font = get_font(max(31, int(size * 0.054)), True)
-    medium_font = get_font(max(18, int(size * 0.028)), False)
     small_font = get_font(max(16, int(size * 0.024)), False)
 
     # Header
@@ -1084,28 +1092,64 @@ def render_report_frame(cctv_bytes: bytes, station: str, captured_at: datetime, 
     title_w, title_h = text_size(draw, title_text, title_font)
     title_x = (size - title_w) // 2
     title_y = margin + ((header_h - title_h) // 2) - 6
-    draw.text(
-        (title_x, title_y),
-        title_text,
-        font=title_font,
-        fill="white",
-    )
+    draw.text((title_x, title_y), title_text, font=title_font, fill="white")
 
     # Image area
     img_top = margin + header_h + int(size * 0.02)
     img_bottom = size - margin - footer_h - int(size * 0.02)
     img_left = margin
     img_right = size - margin
+    image_box_w = img_right - img_left
+    image_box_h = img_bottom - img_top
 
     try:
-        im = Image.open(io.BytesIO(cctv_bytes)).convert("RGB")
-        im = ImageOps.fit(
-            im,
-            (img_right - img_left, img_bottom - img_top),
+        orig = Image.open(io.BytesIO(cctv_bytes)).convert("RGB")
+        # ใช้ contain แทน fit เพื่อไม่ให้ด้านบนโดนครอปจนเวลา CCTV มุมซ้ายบนหาย
+        fitted = ImageOps.contain(
+            orig,
+            (image_box_w, image_box_h),
             method=Image.Resampling.LANCZOS,
-            centering=(0.5, 0.5),
         )
-        canvas.paste(im, (img_left, img_top))
+        image_panel = Image.new("RGB", (image_box_w, image_box_h), (16, 28, 44))
+        paste_x = (image_box_w - fitted.width) // 2
+        paste_y = (image_box_h - fitted.height) // 2
+        image_panel.paste(fitted, (paste_x, paste_y))
+        canvas.paste(image_panel, (img_left, img_top))
+
+        if zoom_timestamp:
+            crop_w = max(120, int(orig.width * 0.34))
+            crop_h = max(26, int(orig.height * 0.12))
+            crop_w = min(crop_w, orig.width)
+            crop_h = min(crop_h, orig.height)
+            ts_crop = orig.crop((0, 0, crop_w, crop_h))
+
+            inset_w = int(image_box_w * 0.38)
+            inset_h = int(image_box_h * 0.13)
+            inset_x = img_right - inset_w - int(size * 0.02)
+            inset_y = img_top + int(size * 0.018)
+
+            draw.rounded_rectangle(
+                (inset_x - 4, inset_y - 4, inset_x + inset_w + 4, inset_y + inset_h + 4),
+                radius=12,
+                fill=(8, 18, 32),
+                outline=(120, 180, 235),
+                width=2,
+            )
+
+            inset_img = ImageOps.contain(
+                ts_crop,
+                (inset_w, inset_h),
+                method=Image.Resampling.NEAREST,
+            )
+            inset_panel = Image.new("RGB", (inset_w, inset_h), (5, 10, 18))
+            inset_panel.paste(inset_img, ((inset_w - inset_img.width) // 2, (inset_h - inset_img.height) // 2))
+            canvas.paste(inset_panel, (inset_x, inset_y))
+
+            # เส้นเชื่อมแบบ popup callout
+            callout_start = (img_left + int(size * 0.10), img_top + int(size * 0.04))
+            callout_mid = (img_left + int(size * 0.18), img_top + int(size * 0.03))
+            callout_end = (inset_x, inset_y + inset_h // 2)
+            draw.line([callout_start, callout_mid, callout_end], fill=(120, 180, 235), width=2)
     except Exception:
         draw.rectangle((img_left, img_top, img_right, img_bottom), fill=(40, 56, 74))
         draw.text((img_left + 20, img_top + 20), "โหลดภาพ CCTV ไม่สำเร็จ", font=label_font, fill="white")
@@ -1128,102 +1172,39 @@ def render_report_frame(cctv_bytes: bytes, station: str, captured_at: datetime, 
 
     # Separator
     sep_x = int(size * 0.505)
-    draw.line(
-        (sep_x, y1 + inner_pad_y, sep_x, y2 - inner_pad_y),
-        fill=(52, 94, 144),
-        width=2,
-    )
+    draw.line((sep_x, y1 + inner_pad_y, sep_x, y2 - inner_pad_y), fill=(52, 94, 144), width=2)
 
     level_text = "-" if water_level is None else f"{water_level:.2f} เมตร"
     level_time = (water_level_dt or captured_at.astimezone(BKK).replace(minute=0, second=0, microsecond=0)).astimezone(BKK)
     current_dt_text = level_time.strftime("%d/%m/%Y %H:%M")
+
     period_start = captured_at.astimezone(BKK).replace(minute=0, second=0, microsecond=0)
     period_end = period_start + timedelta(hours=1)
-    period_text = f"{period_start.strftime('%d/%m/%Y %H:%M')} - {period_end.strftime('%H:%M')} น."
+    period_text = fixed_period_text or f"{period_start.strftime('%d/%m/%Y %H:%M')} - {period_end.strftime('%H:%M')} น."
 
-    # LEFT BLOCK: current water level + latest water-level timestamp only
+    # LEFT BLOCK: current water level + latest fixed hour
     left_w = sep_x - left_x - inner_pad_x
-    draw.text(
-        (left_x, top_y + int(content_h * 0.02)),
-        "ระดับน้ำปัจจุบัน",
-        font=label_font,
-        fill=(190, 220, 252),
-    )
-    draw.text(
-        (left_x, top_y + int(content_h * 0.30)),
-        level_text,
-        font=value_font,
-        fill="white",
-    )
+    draw.text((left_x, top_y + int(content_h * 0.02)), "ระดับน้ำปัจจุบัน", font=label_font, fill=(190, 220, 252))
+    draw.text((left_x, top_y + int(content_h * 0.30)), level_text, font=value_font, fill="white")
 
-    left_time_font = fit_font_to_width(
-        draw,
-        current_dt_text,
-        max_width=left_w,
-        start_size=max(17, int(size * 0.028)),
-        bold=False,
-        min_size=13,
-    )
-    draw.text(
-        (left_x, top_y + int(content_h * 0.70)),
-        current_dt_text,
-        font=left_time_font,
-        fill=(216, 228, 240),
-    )
+    left_time_font = fit_font_to_width(draw, current_dt_text, max_width=left_w, start_size=max(17, int(size * 0.028)), bold=False, min_size=13)
+    draw.text((left_x, top_y + int(content_h * 0.70)), current_dt_text, font=left_time_font, fill=(216, 228, 240))
 
-    # RIGHT BLOCK: time range only
+    # RIGHT BLOCK: overall CCTV range (fixed for the whole GIF when provided)
     right_w = size - margin - right_x - inner_pad_x
-    right_title = "CCTV"
-    draw.text(
-        (right_x, top_y + int(content_h * 0.02)),
-        right_title,
-        font=label_font,
-        fill=(190, 220, 252),
-    )
+    draw.text((right_x, top_y + int(content_h * 0.02)), "CCTV", font=label_font, fill=(190, 220, 252))
 
-    period_font = fit_font_to_width(
-        draw,
-        period_text,
-        max_width=right_w,
-        start_size=max(18, int(size * 0.028)),
-        bold=False,
-        min_size=13,
-    )
-    period_lines = wrap_text_to_width(
-        draw,
-        period_text,
-        period_font,
-        max_width=right_w,
-        max_lines=2,
-    )
+    period_font = fit_font_to_width(draw, period_text, max_width=right_w, start_size=max(17, int(size * 0.027)), bold=False, min_size=12)
+    period_lines = wrap_text_to_width(draw, period_text, period_font, max_width=right_w, max_lines=2)
     line_h = text_size(draw, "Ag", period_font)[1] + 5
     start_line_y = top_y + int(content_h * 0.35)
     for i, line in enumerate(period_lines):
-        draw.text(
-            (right_x, start_line_y + (i * line_h)),
-            line,
-            font=period_font,
-            fill="white" if i == 0 else (216, 228, 240),
-        )
+        draw.text((right_x, start_line_y + (i * line_h)), line, font=period_font, fill="white" if i == 0 else (216, 228, 240))
 
     source_text = "ระบบโทรมาตร กรมชลประทาน"
-    source_font = fit_font_to_width(
-        draw,
-        source_text,
-        max_width=right_w,
-        start_size=max(14, int(size * 0.022)),
-        bold=False,
-        min_size=11,
-    )
-    source_lines = wrap_text_to_width(draw, source_text, source_font, max_width=right_w, max_lines=2)
-    source_y = y2 - inner_pad_y - (len(source_lines) * (text_size(draw, "Ag", source_font)[1] + 2))
-    for i, line in enumerate(source_lines):
-        draw.text(
-            (right_x, source_y + i * (text_size(draw, "Ag", source_font)[1] + 2)),
-            line,
-            font=source_font,
-            fill=(193, 210, 229),
-        )
+    source_font = fit_font_to_width(draw, source_text, max_width=right_w, start_size=max(14, int(size * 0.022)), bold=False, min_size=11)
+    source_y = y2 - inner_pad_y - text_size(draw, "Ag", source_font)[1]
+    draw.text((right_x, source_y), source_text, font=source_font, fill=(193, 210, 229))
 
     return canvas
 
@@ -1449,9 +1430,21 @@ def build_gif(station: str, hours: int, step: int, progress_cb=None):
         progress_cb(80, "กำลังจัดวางภาพรายงาน...")
     frames = []
     total_results = max(1, len(results))
+    slots_only = [slot for slot, _ in results]
+    fixed_period_text = build_overall_period_text(slots_only)
+    latest_slot_hour = max(slots_only).astimezone(BKK).replace(minute=0, second=0, microsecond=0)
+    fixed_level = nearest_water_level(history, latest_slot_hour)
+    fixed_level_dt = latest_slot_hour
     for idx, (slot, b) in enumerate(results, start=1):
-        level, level_dt = playback_hour_water_level(history, slot)
-        fr = render_report_frame(b, station, slot, level, GIF_SIZE, water_level_dt=level_dt)
+        fr = render_report_frame(
+            b,
+            station,
+            slot,
+            fixed_level,
+            GIF_SIZE,
+            water_level_dt=fixed_level_dt,
+            fixed_period_text=fixed_period_text,
+        )
         fr = fr.quantize(colors=128, method=Image.Quantize.MEDIANCUT)
         frames.append(fr)
         if progress_cb and idx % max(1, total_results // 5) == 0:
@@ -1519,27 +1512,31 @@ def build_combined_gif(hours: int, step: int, progress_cb=None):
 
     frames = []
     total_slots = max(1, len(common_slots))
+    fixed_period_text = build_overall_period_text(common_slots)
+    latest_common_hour = max(common_slots).astimezone(BKK).replace(minute=0, second=0, microsecond=0)
+    fixed_left_level = nearest_water_level(h1, latest_common_hour)
+    fixed_right_level = nearest_water_level(h67, latest_common_hour)
     for idx, slot in enumerate(common_slots, start=1):
         if slot not in bytes1 or slot not in bytes67:
             continue
 
-        left_level, left_level_dt = playback_hour_water_level(h1, slot)
-        right_level, right_level_dt = playback_hour_water_level(h67, slot)
         left = render_report_frame(
             bytes1[slot],
             "P.1",
             slot,
-            left_level,
+            fixed_left_level,
             GIF_SIZE,
-            water_level_dt=left_level_dt,
+            water_level_dt=latest_common_hour,
+            fixed_period_text=fixed_period_text,
         )
         right = render_report_frame(
             bytes67[slot],
             "P.67",
             slot,
-            right_level,
+            fixed_right_level,
             GIF_SIZE,
-            water_level_dt=right_level_dt,
+            water_level_dt=latest_common_hour,
+            fixed_period_text=fixed_period_text,
         )
 
         canvas = Image.new(
@@ -1598,7 +1595,7 @@ HTML = """
 <head>
 <meta charset=\"utf-8\">
 <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">
-<title>Ping River Image Center v23</title>
+<title>Ping River Image Center v24</title>
 <style>
 :root{color-scheme:dark}
 *{box-sizing:border-box}
@@ -1625,7 +1622,7 @@ select{background:#0a1728;color:white;border:1px solid #36506c;padding:9px;borde
 </head>
 <body>
 <div class=\"wrap\">
-  <h1>🌊 Ping River Image Center v23</h1>
+  <h1>🌊 Ping River Image Center v24</h1>
   <div class=\"sub\">เวอร์ชันนี้ใช้ CCTV Playback แบบวิดีโอรายชั่วโมงเพื่อสร้าง GIF จากภาพจริงย้อนหลัง</div>
 
   <div class=\"grid\">
