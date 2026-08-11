@@ -64,7 +64,7 @@ def make_session():
     )
     s.mount("https://", HTTPAdapter(max_retries=retry))
     s.headers.update({
-        "User-Agent": "Mozilla/5.0 (PingRiverImageCenter/27.0)",
+        "User-Agent": "Mozilla/5.0 (PingRiverImageCenter/30.0)",
         "Accept": "*/*",
         "Referer": "https://appserv.net/pingriver.php",
     })
@@ -833,18 +833,38 @@ def wallclock_offset_to_video_seconds(offset_seconds: int, duration: float):
 
 def extract_frames_for_tasks(tasks, progress_cb=None, progress_start=0, progress_end=100, progress_label='กำลังดึงเฟรม'):
     """
-    ดาวน์โหลด MP4 ต่อชั่วโมงเพียงครั้งเดียว
-    แล้วสกัดหลายเฟรมจากไฟล์ local ตามสัดส่วนเวลา
-
-    return:
-      results = [(slot, jpeg_bytes), ...]
-      diagnostics = [...]
+    รองรับทั้ง MP4 playback และภาพ CCTV ล่าสุด (snapshot)
     """
     if not tasks:
         return [], []
 
+    results = []
+    diagnostics = []
+
+    snapshot_tasks = [t for t in tasks if t.get("source_type") == "snapshot"]
+    video_tasks = [t for t in tasks if t.get("source_type") != "snapshot"]
+
+    # snapshot ล่าสุด
+    for task in snapshot_tasks:
+        try:
+            b = fetch_bytes(task["snapshot_url"] + f"?t={int(now_bkk().timestamp())}")
+            results.append((task["slot"], b))
+            diagnostics.append({
+                "station": task["station"],
+                "file": "LATEST_JPG",
+                "slot": task["slot"].isoformat(),
+                "ok_frames": 1,
+            })
+        except Exception as e:
+            diagnostics.append({
+                "station": task["station"],
+                "file": "LATEST_JPG",
+                "slot": task["slot"].isoformat(),
+                "error": str(e),
+            })
+
     groups = {}
-    for task in tasks:
+    for task in video_tasks:
         groups.setdefault(
             (task["station"], task["rel_file"]),
             {
@@ -855,34 +875,25 @@ def extract_frames_for_tasks(tasks, progress_cb=None, progress_start=0, progress
             },
         )["tasks"].append(task)
 
-    results = []
-    diagnostics = []
     ordered_groups = sorted(
         groups.items(),
         key=lambda kv: min(t["slot"] for t in kv[1]["tasks"])
     )
     total_groups = max(1, len(ordered_groups))
 
-    # ทำทีละไฟล์เพื่อไม่ให้ Render Free ใช้ disk/network หนักเกิน
     for idx, ((_, _), group) in enumerate(ordered_groups, start=1):
         if progress_cb:
             group_pct = ((idx - 1) / total_groups) * 100.0
             progress_cb(group_pct, f"กำลังประมวลผล {idx}/{total_groups}")
         video_path = None
         try:
-            video_path = download_playback_video(
-                group["urls"],
-                group["station"],
-            )
+            video_path = download_playback_video(group["urls"], group["station"])
             size_bytes = os.path.getsize(video_path)
             duration = probe_video_duration(video_path)
 
             ok_count = 0
             for task in sorted(group["tasks"], key=lambda x: x["slot"]):
-                target = wallclock_offset_to_video_seconds(
-                    task["offset"],
-                    duration,
-                )
+                target = wallclock_offset_to_video_seconds(task["offset"], duration)
                 try:
                     frame = extract_frame_from_local_video(video_path, target)
                     results.append((task["slot"], frame))
@@ -922,7 +933,6 @@ def extract_frames_for_tasks(tasks, progress_cb=None, progress_start=0, progress
 
     results.sort(key=lambda x: x[0])
     return results, diagnostics
-
 
 def ffmpeg_extract_frame(urls, offset_seconds: int, station: str):
     """
@@ -1055,10 +1065,25 @@ def playback_hour_water_level(history, slot_dt):
 def build_overall_period_text(slots):
     if not slots:
         return "-"
-    first_slot = min(slots).astimezone(BKK).replace(minute=0, second=0, microsecond=0)
-    last_slot = max(slots).astimezone(BKK).replace(minute=0, second=0, microsecond=0)
-    end_dt = last_slot + timedelta(minutes=59)
-    return f"{first_slot.strftime('%d/%m/%Y %H:%M')} - {end_dt.strftime('%d/%m/%Y %H:%M')} น."
+    first_slot = min(slots).astimezone(BKK)
+    last_slot = max(slots).astimezone(BKK)
+    return f"{first_slot.strftime('%d/%m/%Y %H:%M')} - {last_slot.strftime('%d/%m/%Y %H:%M')} น."
+
+
+def build_period_text_from_cam(cam, slots=None):
+    try:
+        start_dt = datetime.fromisoformat(cam.get("requested_start_boundary"))
+        end_dt = datetime.fromisoformat(cam.get("requested_end_boundary"))
+        return f"{start_dt.astimezone(BKK).strftime('%d/%m/%Y %H:%M')} - {end_dt.astimezone(BKK).strftime('%d/%m/%Y %H:%M')} น."
+    except Exception:
+        return build_overall_period_text(slots or [])
+
+
+def latest_water_level(history):
+    if not history:
+        return None, None
+    latest_dt, latest_level = max(history, key=lambda x: x[0])
+    return latest_level, latest_dt.astimezone(BKK)
 
 
 def render_report_frame(cctv_bytes: bytes, station: str, captured_at: datetime, water_level, size: int, water_level_dt=None, fixed_period_text=None, zoom_timestamp=True):
@@ -1117,21 +1142,21 @@ def render_report_frame(cctv_bytes: bytes, station: str, captured_at: datetime, 
         canvas.paste(image_panel, (img_left, img_top))
 
         if zoom_timestamp:
-            # ขยายบริเวณวันที่เวลา มุมซ้ายบน โดยครอปให้แคบลงและขยายให้เต็มกรอบพอดี
-            crop_w = max(135, int(orig.width * 0.24))
-            crop_h = max(28, int(orig.height * 0.065))
+            # ขยายบริเวณวันที่เวลา มุมซ้ายบน โดยทำกรอบให้สั้นลงและเนื้อหาเต็มกรอบมากขึ้น
+            crop_w = max(128, int(orig.width * 0.205))
+            crop_h = max(24, int(orig.height * 0.055))
             crop_w = min(crop_w, orig.width)
             crop_h = min(crop_h, orig.height)
             ts_crop = orig.crop((0, 0, crop_w, crop_h))
 
             crop_ratio = crop_w / max(1, crop_h)
-            inset_h = int(image_box_h * 0.12)
+            inset_h = int(image_box_h * 0.105)
             inset_w = int(inset_h * crop_ratio)
-            inset_w = min(inset_w, int(image_box_w * 0.46))
+            inset_w = min(inset_w, int(image_box_w * 0.30))
             inset_h = int(inset_w / crop_ratio)
 
-            inset_x = img_left + int(size * 0.028)
-            inset_y = img_top + int(size * 0.052)
+            inset_x = img_left + int(size * 0.026)
+            inset_y = img_top + int(size * 0.050)
 
             draw.rounded_rectangle(
                 (inset_x - 4, inset_y - 4, inset_x + inset_w + 4, inset_y + inset_h + 4),
@@ -1141,20 +1166,22 @@ def render_report_frame(cctv_bytes: bytes, station: str, captured_at: datetime, 
                 width=2,
             )
 
-            # ใช้ fit เพื่อให้ภาพซูมเต็มกรอบ ไม่มีพื้นที่ว่าง และตัวเลขชัดขึ้น
+            # ใช้ fit เต็มกรอบ และดันภาพขึ้นด้านบนเล็กน้อยให้ตัวเลขอยู่ในจุดเด่น
+            target_w = max(1, inset_w - 8)
+            target_h = max(1, inset_h - 8)
             inset_img = ImageOps.fit(
                 ts_crop,
-                (max(1, inset_w - 8), max(1, inset_h - 8)),
+                (target_w, target_h),
                 method=Image.Resampling.NEAREST,
                 centering=(0.0, 0.0),
             )
             inset_panel = Image.new("RGB", (inset_w, inset_h), (5, 10, 18))
-            inset_panel.paste(inset_img, (4, 4))
+            inset_panel.paste(inset_img, (4, 1))
             canvas.paste(inset_panel, (inset_x, inset_y))
 
             # เส้นชี้สั้น ๆ จาก timestamp เดิมลงมาหากรอบซูม
             callout_start = (img_left + int(size * 0.078), img_top + int(size * 0.030))
-            callout_mid = (img_left + int(size * 0.086), img_top + int(size * 0.043))
+            callout_mid = (img_left + int(size * 0.083), img_top + int(size * 0.040))
             callout_end = (inset_x + int(inset_w * 0.22), inset_y)
             draw.line([callout_start, callout_mid, callout_end], fill=(120, 180, 235), width=2)
     except Exception:
@@ -1302,15 +1329,14 @@ def build_inclusive_hour_range_tasks(station: str, start_dt: datetime, end_hour_
 
 def build_slot_tasks(station: str, hours: int, step: int):
     """
-    v9:
-    ไม่ยึด now เป็นปลายช่วง เพราะไฟล์ hourly ของ AppServ อาจ lag 1-2 ชั่วโมง
-    ให้ยึด "ไฟล์ Playback ล่าสุดที่มีจริง" เป็นปลายช่วงแทน
+    v29: Rolling Window ตามเวลาปัจจุบันจริง
 
     ตัวอย่าง:
-      ตอนนี้ 13:04
-      newest file = hourly/2026-08-11_11.mp4
-      ไฟล์นี้แทน 11:00-12:00
-      hours=1 => สุ่มเฟรมใน 11:00-12:00
+      ตอนนี้ 14:00, hours=1 -> 13:00 ถึง 14:00
+      ตอนนี้ 14:30, hours=1 -> 13:30 ถึง 14:30
+
+    ถ้า MP4 ของชั่วโมงปัจจุบันยังไม่ถูกสร้าง จะใช้ภาพ CCTV ล่าสุด
+    เป็นเฟรมปลายทางแทน เพื่อไม่ให้ช่วงเวลาถอยไปตามไฟล์ playback ที่เสร็จแล้ว
     """
     cam = fetch_camlist(station)
     exp = cam.get("exp")
@@ -1335,7 +1361,6 @@ def build_slot_tasks(station: str, hours: int, step: int):
     cam["exp"] = exp
     cam["sig"] = sig
 
-    # map เฉพาะไฟล์ที่มีจริง
     file_map = {}
     available_hours = []
     for rel in cam["files"]:
@@ -1344,34 +1369,24 @@ def build_slot_tasks(station: str, hours: int, step: int):
             file_map[dt] = rel
             available_hours.append(dt)
 
-    if not available_hours:
-        return [], cam
-
     available_hours.sort()
 
-    # newest_hour คือเวลาเริ่มต้นของไฟล์ล่าสุดที่มีจริง
-    newest_hour = available_hours[-1]
-
-    # ชั่วโมงปลายทางรวมทั้งชั่วโมงล่าสุดที่มีจริง
-    # เช่น newest_hour = 13:00 หมายถึงรวมไฟล์ 13.mp4 จนถึงประมาณ 13:59
-    end_boundary = newest_hour + timedelta(hours=1)
-
-    # "ย้อนหลัง N ชั่วโมง" ให้ตีความชั่วโมงต้นทางถึงชั่วโมงปลายทางแบบ inclusive
-    # ตัวอย่าง hours=1 และ newest_hour=13:00
-    # => ดึงตั้งแต่ 12:00 ถึงประมาณ 13:59
-    start_boundary = newest_hour - timedelta(hours=hours)
+    # จบช่วงที่เวลาปัจจุบันจริง (ปัดวินาทีทิ้ง เพื่อให้ข้อความอ่านง่าย)
+    end_boundary = now_bkk().replace(second=0, microsecond=0)
+    start_boundary = end_boundary - timedelta(hours=hours)
 
     tasks = []
     cursor = start_boundary
 
-    # slot ต้องอยู่ก่อน end_boundary เท่านั้น
-    while cursor < end_boundary:
+    # รวมปลายช่วงด้วย เช่น 13:30, 14:30 เมื่อ step=60
+    while cursor <= end_boundary:
         hour_dt = cursor.replace(minute=0, second=0, microsecond=0)
         rel = file_map.get(hour_dt)
 
         if rel:
             offset = int((cursor - hour_dt).total_seconds())
             tasks.append({
+                "source_type": "video",
                 "station": station,
                 "slot": cursor,
                 "rel_file": rel,
@@ -1383,21 +1398,64 @@ def build_slot_tasks(station: str, hours: int, step: int):
                     sig=sig,
                 ),
             })
+        elif cursor == end_boundary:
+            # ชั่วโมงปัจจุบันยังเป็น file:null ได้ จึงใช้ CCTV ล่าสุดเป็นเฟรมปลายทาง
+            try:
+                latest_url, _ = latest_cache_jpg(station)
+                tasks.append({
+                    "source_type": "snapshot",
+                    "station": station,
+                    "slot": cursor,
+                    "snapshot_url": latest_url,
+                    "rel_file": "LATEST_JPG",
+                    "offset": 0,
+                    "urls": [],
+                })
+            except Exception:
+                pass
 
         cursor += timedelta(minutes=step)
 
-    # unique
+    # ถ้า step หารช่วงไม่ลงตัว ให้แน่ใจว่ามีเฟรมปลายทาง "ตอนนี้"
+    if tasks and tasks[-1]["slot"] < end_boundary:
+        hour_dt = end_boundary.replace(minute=0, second=0, microsecond=0)
+        rel = file_map.get(hour_dt)
+        if rel:
+            tasks.append({
+                "source_type": "video",
+                "station": station,
+                "slot": end_boundary,
+                "rel_file": rel,
+                "offset": int((end_boundary - hour_dt).total_seconds()),
+                "urls": playback_url_candidates(station, rel, exp=exp, sig=sig),
+            })
+        else:
+            try:
+                latest_url, _ = latest_cache_jpg(station)
+                tasks.append({
+                    "source_type": "snapshot",
+                    "station": station,
+                    "slot": end_boundary,
+                    "snapshot_url": latest_url,
+                    "rel_file": "LATEST_JPG",
+                    "offset": 0,
+                    "urls": [],
+                })
+            except Exception:
+                pass
+
     uniq = []
     seen = set()
     for t in tasks:
-        key = (t["slot"], t["rel_file"], t["offset"])
+        key = (t["slot"], t.get("rel_file"), t.get("offset"), t.get("source_type"))
         if key not in seen:
             seen.add(key)
             uniq.append(t)
 
-    cam["latest_available_hour"] = newest_hour.isoformat()
-    cam["playback_end_boundary"] = end_boundary.isoformat()
+    cam["latest_available_hour"] = available_hours[-1].isoformat() if available_hours else None
     cam["requested_start_boundary"] = start_boundary.isoformat()
+    cam["requested_end_boundary"] = end_boundary.isoformat()
+    cam["playback_end_boundary"] = end_boundary.isoformat()
     cam["task_count"] = len(uniq)
 
     return uniq, cam
@@ -1438,10 +1496,12 @@ def build_gif(station: str, hours: int, step: int, progress_cb=None):
     frames = []
     total_results = max(1, len(results))
     slots_only = [slot for slot, _ in results]
-    fixed_period_text = build_overall_period_text(slots_only)
-    latest_slot_hour = max(slots_only).astimezone(BKK).replace(minute=0, second=0, microsecond=0)
-    fixed_level = nearest_water_level(history, latest_slot_hour)
-    fixed_level_dt = latest_slot_hour
+    fixed_period_text = build_period_text_from_cam(cam, slots_only)
+    fixed_level, fixed_level_dt = latest_water_level(history)
+    if fixed_level_dt is None:
+        latest_slot_hour = max(slots_only).astimezone(BKK).replace(minute=0, second=0, microsecond=0)
+        fixed_level = nearest_water_level(history, latest_slot_hour)
+        fixed_level_dt = latest_slot_hour
     for idx, (slot, b) in enumerate(results, start=1):
         fr = render_report_frame(
             b,
@@ -1519,10 +1579,24 @@ def build_combined_gif(hours: int, step: int, progress_cb=None):
 
     frames = []
     total_slots = max(1, len(common_slots))
-    fixed_period_text = build_overall_period_text(common_slots)
-    latest_common_hour = max(common_slots).astimezone(BKK).replace(minute=0, second=0, microsecond=0)
-    fixed_left_level = nearest_water_level(h1, latest_common_hour)
-    fixed_right_level = nearest_water_level(h67, latest_common_hour)
+    try:
+        p1_start = datetime.fromisoformat(p1_cam.get("requested_start_boundary"))
+        p67_start = datetime.fromisoformat(p67_cam.get("requested_start_boundary"))
+        p1_end = datetime.fromisoformat(p1_cam.get("requested_end_boundary"))
+        p67_end = datetime.fromisoformat(p67_cam.get("requested_end_boundary"))
+        period_start = max(p1_start, p67_start)
+        period_end = min(p1_end, p67_end)
+        fixed_period_text = f"{period_start.astimezone(BKK).strftime('%d/%m/%Y %H:%M')} - {period_end.astimezone(BKK).strftime('%d/%m/%Y %H:%M')} น."
+    except Exception:
+        fixed_period_text = build_overall_period_text(common_slots)
+    fixed_left_level, fixed_left_dt = latest_water_level(h1)
+    fixed_right_level, fixed_right_dt = latest_water_level(h67)
+    if fixed_left_dt is None:
+        fixed_left_dt = max(common_slots).astimezone(BKK).replace(minute=0, second=0, microsecond=0)
+        fixed_left_level = nearest_water_level(h1, fixed_left_dt)
+    if fixed_right_dt is None:
+        fixed_right_dt = max(common_slots).astimezone(BKK).replace(minute=0, second=0, microsecond=0)
+        fixed_right_level = nearest_water_level(h67, fixed_right_dt)
     for idx, slot in enumerate(common_slots, start=1):
         if slot not in bytes1 or slot not in bytes67:
             continue
@@ -1533,7 +1607,7 @@ def build_combined_gif(hours: int, step: int, progress_cb=None):
             slot,
             fixed_left_level,
             GIF_SIZE,
-            water_level_dt=latest_common_hour,
+            water_level_dt=fixed_left_dt,
             fixed_period_text=fixed_period_text,
         )
         right = render_report_frame(
@@ -1542,7 +1616,7 @@ def build_combined_gif(hours: int, step: int, progress_cb=None):
             slot,
             fixed_right_level,
             GIF_SIZE,
-            water_level_dt=latest_common_hour,
+            water_level_dt=fixed_right_dt,
             fixed_period_text=fixed_period_text,
         )
 
@@ -1602,7 +1676,7 @@ HTML = """
 <head>
 <meta charset=\"utf-8\">
 <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">
-<title>Ping River Image Center v27</title>
+<title>Ping River Image Center v30</title>
 <style>
 :root{color-scheme:dark}
 *{box-sizing:border-box}
@@ -1629,7 +1703,7 @@ select{background:#0a1728;color:white;border:1px solid #36506c;padding:9px;borde
 </head>
 <body>
 <div class=\"wrap\">
-  <h1>🌊 Ping River Image Center v27</h1>
+  <h1>🌊 Ping River Image Center v30</h1>
   <div class=\"sub\">เวอร์ชันนี้ใช้ CCTV Playback แบบวิดีโอรายชั่วโมงเพื่อสร้าง GIF จากภาพจริงย้อนหลัง</div>
 
   <div class=\"grid\">
@@ -1680,7 +1754,6 @@ select{background:#0a1728;color:white;border:1px solid #36506c;padding:9px;borde
         </select>
       </label>
     </div>
-    <div class=\"muted\">ค่าเริ่มต้น: ย้อนหลัง 24 ชั่วโมง และดึงภาพทุก 1 ชั่วโมง | ระบบเลือกช่วง CCTV ให้อัตโนมัติ โดยรวมชั่วโมงปลายทางทั้งชั่วโมง เช่น 12:00–13:59</div>
     <div class=\"row\">
       <button onclick=\"makeGif('P.1')\">GIF P.1</button>
       <button onclick=\"makeGif('P.67')\">GIF P.67</button>
@@ -1690,10 +1763,6 @@ select{background:#0a1728;color:white;border:1px solid #36506c;padding:9px;borde
     <div class=\"progress-wrap\"><div class=\"progress-bar\" id=\"workProgressBar\"></div></div>
     <div class=\"muted\" id=\"workProgressText\">พร้อมสร้าง GIF</div>
   </section>
-
-  <div class=\"note\">
-    ถ้า PNG ใช้ได้แต่ GIF มี error ให้เปิด <code>/api/debug/camlist?station=P.67</code> แล้วส่งผลกลับมา
-  </div>
 </div>
 <script>
 const id = s => s.replace('.','');
@@ -1895,23 +1964,13 @@ def history_check(station: str = Query(...), hours: int = Query(24, ge=1, le=72)
         dts = [parse_hourly_filename(x) for x in cam["files"]]
         dts = sorted([x for x in dts if x])
 
-        if not dts:
-            return {
-                "station": station,
-                "hours": hours,
-                "total_files": 0,
-                "in_period": 0,
-                "first": None,
-                "last": None,
-            }
+        end_boundary = now_bkk().replace(second=0, microsecond=0)
+        cutoff = end_boundary - timedelta(hours=hours)
 
-        latest = dts[-1]
-        end_boundary = latest + timedelta(hours=1)
-        cutoff = latest - timedelta(hours=hours)
-
+        # นับไฟล์รายชั่วโมงที่ทับซ้อนกับ rolling window
         in_period = [
             x for x in dts
-            if cutoff <= x < end_boundary
+            if (x + timedelta(hours=1)) > cutoff and x <= end_boundary
         ]
 
         return {
@@ -1919,11 +1978,11 @@ def history_check(station: str = Query(...), hours: int = Query(24, ge=1, le=72)
             "hours": hours,
             "total_files": len(dts),
             "in_period": len(in_period),
-            "first": dts[0].isoformat(),
-            "last": dts[-1].isoformat(),
-            "latest_available_hour": latest.isoformat(),
-            "playback_end_boundary": end_boundary.isoformat(),
+            "first": dts[0].isoformat() if dts else None,
+            "last": dts[-1].isoformat() if dts else None,
+            "latest_available_hour": dts[-1].isoformat() if dts else None,
             "requested_start_boundary": cutoff.isoformat(),
+            "requested_end_boundary": end_boundary.isoformat(),
             "sig_present": bool(cam.get("sig")),
             "exp": cam.get("exp"),
         }
