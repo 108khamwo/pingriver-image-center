@@ -1,4 +1,4 @@
-# Ping River Image Center v13
+# Ping River Image Center v14
 
 เวอร์ชันนี้อัปเดตให้ใช้ CCTV Playback แบบวิดีโอรายชั่วโมง (`hourly/*.mp4`) เพื่อสร้าง GIF จากภาพจริงย้อนหลัง
 
@@ -144,3 +144,19 @@ API ใหม่:
 - เพิ่มหัวข้อ `ช่วงเวลา` เช่น `ช่วง 11/08/2026 11:00 - 12:00 น.`
 - ขยายส่วนหัวให้ใหญ่ขึ้น
 - ปรับโทนภาพรวมให้เป็นสีฟ้ามากขึ้น
+
+
+## แก้ไข v14 — Hotfix fit_font_to_width
+v13 มีบั๊กจากการรวมไฟล์ ทำให้ helper สำหรับจัดขนาดข้อความหลุดออกไป และเกิด:
+`name 'fit_font_to_width' is not defined`
+
+v14 คืนฟังก์ชัน:
+- `text_size`
+- `fit_font_to_width`
+- `wrap_text_to_width`
+
+คงความสามารถเดิมทั้งหมด:
+- Prompt font
+- Layout/โทนฟ้า v13
+- GIF Playback
+- Progress bar / สถานะการสร้าง GIF

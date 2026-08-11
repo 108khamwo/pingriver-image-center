@@ -64,7 +64,7 @@ def make_session():
     )
     s.mount("https://", HTTPAdapter(max_retries=retry))
     s.headers.update({
-        "User-Agent": "Mozilla/5.0 (PingRiverImageCenter/13.0)",
+        "User-Agent": "Mozilla/5.0 (PingRiverImageCenter/14.0)",
         "Accept": "*/*",
         "Referer": "https://appserv.net/pingriver.php",
     })
@@ -186,6 +186,114 @@ def get_font(size, bold=False):
             return ImageFont.truetype(p, size=size)
     return ImageFont.load_default()
 
+
+
+def text_size(draw: ImageDraw.ImageDraw, text: str, font):
+    """คืนค่าความกว้าง/สูงของข้อความด้วยฟอนต์ที่กำหนด"""
+    box = draw.textbbox((0, 0), str(text), font=font)
+    return box[2] - box[0], box[3] - box[1]
+
+
+def fit_font_to_width(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    max_width: int,
+    start_size: int,
+    bold: bool = False,
+    min_size: int = 12,
+):
+    """ลดขนาดฟอนต์อัตโนมัติจนข้อความพอดีกับความกว้าง"""
+    text = str(text)
+    max_width = max(1, int(max_width))
+    size = max(int(start_size), int(min_size))
+
+    while size >= min_size:
+        font = get_font(size, bold)
+        width, _ = text_size(draw, text, font)
+        if width <= max_width:
+            return font
+        size -= 1
+
+    return get_font(min_size, bold)
+
+
+def wrap_text_to_width(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    font,
+    max_width: int,
+    max_lines: int = 2,
+):
+    """ตัดบรรทัดข้อความให้พอดีกับกรอบ โดยไม่เกิน max_lines"""
+    text = str(text).strip()
+    if not text:
+        return [""]
+
+    max_width = max(1, int(max_width))
+    max_lines = max(1, int(max_lines))
+    words = text.split()
+
+    # ภาษาไทยบางข้อความไม่มี space มากพอ: fallback ตัดทีละตัวอักษร
+    if len(words) <= 1:
+        lines = []
+        current = ""
+        for ch in text:
+            trial = current + ch
+            width, _ = text_size(draw, trial, font)
+            if width <= max_width or not current:
+                current = trial
+            else:
+                lines.append(current)
+                current = ch
+                if len(lines) >= max_lines - 1:
+                    break
+        if current and len(lines) < max_lines:
+            lines.append(current)
+
+        consumed = "".join(lines)
+        if len(consumed) < len(text) and lines:
+            remaining = text[len(consumed):]
+            lines[-1] += remaining
+
+        # trim last line with ellipsis
+        if lines:
+            last = lines[-1]
+            while text_size(draw, last, font)[0] > max_width and len(last) > 1:
+                last = last[:-2].rstrip() + "…"
+            lines[-1] = last
+        return lines[:max_lines]
+
+    lines = []
+    current = ""
+
+    for word in words:
+        trial = word if not current else current + " " + word
+        width, _ = text_size(draw, trial, font)
+
+        if width <= max_width or not current:
+            current = trial
+        else:
+            lines.append(current)
+            current = word
+            if len(lines) >= max_lines - 1:
+                break
+
+    if current and len(lines) < max_lines:
+        lines.append(current)
+
+    # รวมคำที่เหลือลงบรรทัดสุดท้าย แล้ว trim
+    used_words = sum(len(line.split()) for line in lines)
+    if used_words < len(words) and lines:
+        remaining = " ".join(words[used_words:])
+        lines[-1] = (lines[-1] + " " + remaining).strip()
+
+    if lines:
+        last = lines[-1]
+        while text_size(draw, last, font)[0] > max_width and len(last) > 1:
+            last = last[:-2].rstrip() + "…"
+        lines[-1] = last
+
+    return lines[:max_lines]
 
 
 def temp_path(suffix: str):
@@ -1389,7 +1497,7 @@ HTML = """
 <head>
 <meta charset=\"utf-8\">
 <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">
-<title>Ping River Image Center v13</title>
+<title>Ping River Image Center v14</title>
 <style>
 :root{color-scheme:dark}
 *{box-sizing:border-box}
@@ -1416,7 +1524,7 @@ select{background:#0a1728;color:white;border:1px solid #36506c;padding:9px;borde
 </head>
 <body>
 <div class=\"wrap\">
-  <h1>🌊 Ping River Image Center v13</h1>
+  <h1>🌊 Ping River Image Center v14</h1>
   <div class=\"sub\">เวอร์ชันนี้ใช้ CCTV Playback แบบวิดีโอรายชั่วโมงเพื่อสร้าง GIF จากภาพจริงย้อนหลัง</div>
 
   <div class=\"grid\">
