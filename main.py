@@ -64,7 +64,7 @@ def make_session():
     )
     s.mount("https://", HTTPAdapter(max_retries=retry))
     s.headers.update({
-        "User-Agent": "Mozilla/5.0 (PingRiverImageCenter/14.0)",
+        "User-Agent": "Mozilla/5.0 (PingRiverImageCenter/16.0)",
         "Accept": "*/*",
         "Referer": "https://appserv.net/pingriver.php",
     })
@@ -1033,13 +1033,21 @@ def nearest_water_level(history, dt):
     return near[1]
 
 
-def render_report_frame(cctv_bytes: bytes, station: str, captured_at: datetime, water_level, size: int):
+def hourly_water_level(history, dt):
+    """
+    ใช้ค่าระดับน้ำตามชั่วโมงเต็ม และคืนทั้งค่า + เวลาที่ใช้แสดงผล
+    """
+    hour_dt = dt.astimezone(BKK).replace(minute=0, second=0, microsecond=0)
+    return nearest_water_level(history, hour_dt), hour_dt
+
+
+def render_report_frame(cctv_bytes: bytes, station: str, captured_at: datetime, water_level, size: int, water_level_dt=None):
     # ปรับโทนโดยรวมให้เป็นสีฟ้ามากขึ้น
     canvas = Image.new("RGB", (size, size), (10, 32, 60))
     draw = ImageDraw.Draw(canvas)
 
     margin = int(size * 0.032)
-    header_h = int(size * 0.145)   # ส่วนหัวใหญ่ขึ้น
+    header_h = int(size * 0.165)   # ส่วนหัวใหญ่ขึ้นอีกและจัดกึ่งกลาง
     footer_h = int(size * 0.24)
 
     title_text = f"{station}  {STATIONS[station]}"
@@ -1047,7 +1055,7 @@ def render_report_frame(cctv_bytes: bytes, station: str, captured_at: datetime, 
         draw,
         title_text,
         max_width=size - (margin * 4),
-        start_size=max(34, int(size * 0.060)),
+        start_size=max(40, int(size * 0.072)),
         bold=True,
         min_size=24,
     )
@@ -1064,7 +1072,7 @@ def render_report_frame(cctv_bytes: bytes, station: str, captured_at: datetime, 
     )
     title_w, title_h = text_size(draw, title_text, title_font)
     draw.text(
-        (int(margin * 1.45), margin + (header_h - title_h) // 2 - 2),
+        ((size - title_w) // 2, margin + (header_h - title_h) // 2 - 2),
         title_text,
         font=title_font,
         fill="white",
@@ -1114,7 +1122,8 @@ def render_report_frame(cctv_bytes: bytes, station: str, captured_at: datetime, 
     )
 
     level_text = "-" if water_level is None else f"{water_level:.2f} เมตร"
-    current_dt_text = captured_at.astimezone(BKK).strftime("%d/%m/%Y %H:%M")
+    level_time = (water_level_dt or captured_at.astimezone(BKK).replace(minute=0, second=0, microsecond=0)).astimezone(BKK)
+    current_dt_text = level_time.strftime("%d/%m/%Y %H:%M")
     period_start = captured_at.astimezone(BKK).replace(minute=0, second=0, microsecond=0)
     period_end = period_start + timedelta(hours=1)
     period_text = f"{period_start.strftime('%d/%m/%Y %H:%M')} - {period_end.strftime('%H:%M')} น."
@@ -1209,9 +1218,9 @@ def latest_png(station: str):
     url, _ = latest_cache_jpg(station)
     dt = camera_timestamp_from_cache_url(url) or now_bkk()
     history, _ = fetch_water_history(station)
-    level = nearest_water_level(history, dt)
+    level, level_dt = hourly_water_level(history, dt)
     b = fetch_bytes(url + f"?t={int(now_bkk().timestamp())}")
-    img = render_report_frame(b, station, dt, level, PNG_SIZE)
+    img = render_report_frame(b, station, dt, level, PNG_SIZE, water_level_dt=level_dt)
     path = temp_path(".png")
     img.save(path, "PNG", optimize=True)
     return path
@@ -1353,8 +1362,8 @@ def build_gif(station: str, hours: int, step: int, progress_cb=None):
     frames = []
     total_results = max(1, len(results))
     for idx, (slot, b) in enumerate(results, start=1):
-        level = nearest_water_level(history, slot)
-        fr = render_report_frame(b, station, slot, level, GIF_SIZE)
+        level, level_dt = hourly_water_level(history, slot)
+        fr = render_report_frame(b, station, slot, level, GIF_SIZE, water_level_dt=level_dt)
         fr = fr.quantize(colors=128, method=Image.Quantize.MEDIANCUT)
         frames.append(fr)
         if progress_cb and idx % max(1, total_results // 5) == 0:
@@ -1426,19 +1435,23 @@ def build_combined_gif(hours: int, step: int, progress_cb=None):
         if slot not in bytes1 or slot not in bytes67:
             continue
 
+        left_level, left_level_dt = hourly_water_level(h1, slot)
+        right_level, right_level_dt = hourly_water_level(h67, slot)
         left = render_report_frame(
             bytes1[slot],
             "P.1",
             slot,
-            nearest_water_level(h1, slot),
+            left_level,
             GIF_SIZE,
+            water_level_dt=left_level_dt,
         )
         right = render_report_frame(
             bytes67[slot],
             "P.67",
             slot,
-            nearest_water_level(h67, slot),
+            right_level,
             GIF_SIZE,
+            water_level_dt=right_level_dt,
         )
 
         canvas = Image.new(
@@ -1497,7 +1510,7 @@ HTML = """
 <head>
 <meta charset=\"utf-8\">
 <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">
-<title>Ping River Image Center v14</title>
+<title>Ping River Image Center v16</title>
 <style>
 :root{color-scheme:dark}
 *{box-sizing:border-box}
@@ -1524,7 +1537,7 @@ select{background:#0a1728;color:white;border:1px solid #36506c;padding:9px;borde
 </head>
 <body>
 <div class=\"wrap\">
-  <h1>🌊 Ping River Image Center v14</h1>
+  <h1>🌊 Ping River Image Center v16</h1>
   <div class=\"sub\">เวอร์ชันนี้ใช้ CCTV Playback แบบวิดีโอรายชั่วโมงเพื่อสร้าง GIF จากภาพจริงย้อนหลัง</div>
 
   <div class=\"grid\">
