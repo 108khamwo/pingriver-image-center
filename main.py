@@ -1117,9 +1117,9 @@ def render_report_frame(cctv_bytes: bytes, station: str, captured_at: datetime, 
     current_dt_text = captured_at.astimezone(BKK).strftime("%d/%m/%Y %H:%M")
     period_start = captured_at.astimezone(BKK).replace(minute=0, second=0, microsecond=0)
     period_end = period_start + timedelta(hours=1)
-    period_text = f"ช่วง {period_start.strftime('%d/%m/%Y %H:%M')} - {period_end.strftime('%H:%M')} น."
+    period_text = f"{period_start.strftime('%d/%m/%Y %H:%M')} - {period_end.strftime('%H:%M')} น."
 
-    # LEFT BLOCK: current water level + current date/time
+    # LEFT BLOCK: current water level + latest water-level timestamp only
     left_w = sep_x - left_x - inner_pad_x
     draw.text(
         (left_x, top_y + int(content_h * 0.02)),
@@ -1149,7 +1149,7 @@ def render_report_frame(cctv_bytes: bytes, station: str, captured_at: datetime, 
         fill=(216, 228, 240),
     )
 
-    # RIGHT BLOCK: date/time period only, no "เวลา CCTV"
+    # RIGHT BLOCK: time range only
     right_w = size - margin - right_x - inner_pad_x
     right_title = "ช่วงเวลา"
     draw.text(
@@ -1184,7 +1184,7 @@ def render_report_frame(cctv_bytes: bytes, station: str, captured_at: datetime, 
             fill="white" if i == 0 else (216, 228, 240),
         )
 
-    source_text = "ข้อมูล AppServ / ระบบโทรมาตร กรมชลประทาน"
+    source_text = "ระบบโทรมาตร กรมชลประทาน"
     source_font = fit_font_to_width(
         draw,
         source_text,
