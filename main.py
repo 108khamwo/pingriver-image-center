@@ -64,7 +64,7 @@ def make_session():
     )
     s.mount("https://", HTTPAdapter(max_retries=retry))
     s.headers.update({
-        "User-Agent": "Mozilla/5.0 (PingRiverImageCenter/17.0)",
+        "User-Agent": "Mozilla/5.0 (PingRiverImageCenter/20.0)",
         "Accept": "*/*",
         "Referer": "https://appserv.net/pingriver.php",
     })
@@ -1058,7 +1058,7 @@ def render_report_frame(cctv_bytes: bytes, station: str, captured_at: datetime, 
     draw = ImageDraw.Draw(canvas)
 
     margin = int(size * 0.032)
-    header_h = int(size * 0.165)   # ส่วนหัวใหญ่ขึ้นอีกและจัดกึ่งกลาง
+    header_h = int(size * 0.175)   # ส่วนหัวใหญ่ขึ้นอีกและจัดกึ่งกลาง
     footer_h = int(size * 0.24)
 
     title_text = f"{station}  {STATIONS[station]}"
@@ -1066,7 +1066,7 @@ def render_report_frame(cctv_bytes: bytes, station: str, captured_at: datetime, 
         draw,
         title_text,
         max_width=size - (margin * 4),
-        start_size=max(40, int(size * 0.072)),
+        start_size=max(44, int(size * 0.078)),
         bold=True,
         min_size=24,
     )
@@ -1082,8 +1082,10 @@ def render_report_frame(cctv_bytes: bytes, station: str, captured_at: datetime, 
         fill=(29, 79, 135),
     )
     title_w, title_h = text_size(draw, title_text, title_font)
+    title_x = (size - title_w) // 2
+    title_y = margin + ((header_h - title_h) // 2) - 6
     draw.text(
-        ((size - title_w) // 2, margin + (header_h - title_h) // 2 - 2),
+        (title_x, title_y),
         title_text,
         font=title_font,
         fill="white",
@@ -1171,7 +1173,7 @@ def render_report_frame(cctv_bytes: bytes, station: str, captured_at: datetime, 
 
     # RIGHT BLOCK: time range only
     right_w = size - margin - right_x - inner_pad_x
-    right_title = "ช่วงเวลา"
+    right_title = "CCTV"
     draw.text(
         (right_x, top_y + int(content_h * 0.02)),
         right_title,
@@ -1235,6 +1237,76 @@ def latest_png(station: str):
     path = temp_path(".png")
     img.save(path, "PNG", optimize=True)
     return path
+
+
+def build_inclusive_hour_range_tasks(station: str, start_dt: datetime, end_hour_dt: datetime, step: int):
+    """
+    ดึง CCTV แบบ inclusive ที่ชั่วโมงปลายทาง
+
+    ตัวอย่าง:
+      start_dt = 12:00
+      end_hour_dt = 13:00
+    จะดึงช่วงจริง 12:00 ถึงก่อน 14:00
+    หรือประมาณ 12:00-13:59
+
+    ใช้ทั้ง hourly/.._12.mp4 และ hourly/.._13.mp4
+    """
+    cam = fetch_camlist(station)
+    exp = cam.get("exp")
+    sig = cam.get("sig")
+    auth_source = "camlist" if (exp and sig) else None
+
+    if not (exp and sig):
+        discovered_exp, discovered_sig = try_discover_sig_from_page(station)
+        if discovered_exp and discovered_sig:
+            exp = discovered_exp
+            sig = discovered_sig
+            auth_source = "page"
+
+    if not (exp and sig):
+        env_exp, env_sig, source = playback_auth_from_env(station)
+        if env_exp and env_sig:
+            exp = env_exp
+            sig = env_sig
+            auth_source = source
+
+    cam["auth_source"] = auth_source
+    cam["exp"] = exp
+    cam["sig"] = sig
+
+    file_map = {}
+    for rel in cam.get("files", []):
+        dt = parse_hourly_filename(rel)
+        if dt:
+            file_map[dt] = rel
+
+    start_dt = start_dt.astimezone(BKK).replace(second=0, microsecond=0)
+    end_hour_dt = end_hour_dt.astimezone(BKK).replace(minute=0, second=0, microsecond=0)
+
+    # สำคัญ: end hour เป็น inclusive จึงขยายไปอีก 1 ชั่วโมง
+    exclusive_end = end_hour_dt + timedelta(hours=1)
+
+    tasks = []
+    cursor = start_dt
+    while cursor < exclusive_end:
+        hour_dt = cursor.replace(minute=0, second=0, microsecond=0)
+        rel = file_map.get(hour_dt)
+        if rel:
+            offset = int((cursor - hour_dt).total_seconds())
+            tasks.append({
+                "station": station,
+                "slot": cursor,
+                "rel_file": rel,
+                "offset": offset,
+                "urls": playback_url_candidates(station, rel, exp=exp, sig=sig),
+            })
+        cursor += timedelta(minutes=step)
+
+    cam["range_start"] = start_dt.isoformat()
+    cam["range_end_inclusive_hour"] = end_hour_dt.isoformat()
+    cam["range_exclusive_end"] = exclusive_end.isoformat()
+    cam["task_count"] = len(tasks)
+    return tasks, cam
 
 
 def build_slot_tasks(station: str, hours: int, step: int):
@@ -1521,7 +1593,7 @@ HTML = """
 <head>
 <meta charset=\"utf-8\">
 <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">
-<title>Ping River Image Center v17</title>
+<title>Ping River Image Center v20</title>
 <style>
 :root{color-scheme:dark}
 *{box-sizing:border-box}
@@ -1548,7 +1620,7 @@ select{background:#0a1728;color:white;border:1px solid #36506c;padding:9px;borde
 </head>
 <body>
 <div class=\"wrap\">
-  <h1>🌊 Ping River Image Center v17</h1>
+  <h1>🌊 Ping River Image Center v20</h1>
   <div class=\"sub\">เวอร์ชันนี้ใช้ CCTV Playback แบบวิดีโอรายชั่วโมงเพื่อสร้าง GIF จากภาพจริงย้อนหลัง</div>
 
   <div class=\"grid\">
@@ -1597,6 +1669,12 @@ select{background:#0a1728;color:white;border:1px solid #36506c;padding:9px;borde
           <option value=\"30\">30 นาที</option>
         </select>
       </label>
+    </div>
+    <div class=\"row\" style=\"margin-top:14px\">
+      <label>เริ่ม <input type=\"datetime-local\" id=\"rangeStart\" style=\"background:#0a1728;color:white;border:1px solid #36506c;padding:9px;border-radius:9px\"></label>
+      <label>ถึงชั่วโมง <input type=\"datetime-local\" id=\"rangeEnd\" style=\"background:#0a1728;color:white;border:1px solid #36506c;padding:9px;border-radius:9px\"></label>
+      <button class=\"alt\" onclick=\"makeGifRange('P.1')\">GIF P.1 ตามช่วง</button>
+      <button class=\"alt\" onclick=\"makeGifRange('P.67')\">GIF P.67 ตามช่วง</button>
     </div>
     <div class=\"row\">
       <button onclick=\"makeGif('P.1')\">GIF P.1</button>
@@ -1665,6 +1743,16 @@ function makeGif(station){
   const h=document.getElementById('hours').value;
   const s=document.getElementById('step').value;
   startJob(`/api/job/start-gif?station=${encodeURIComponent(station)}&hours=${h}&step=${s}`);
+}
+function makeGifRange(station){
+  const start=document.getElementById('rangeStart').value;
+  const end=document.getElementById('rangeEnd').value;
+  const s=document.getElementById('step').value;
+  if(!start || !end){
+    setWorkProgress(0,'กรุณาเลือกเวลาเริ่มและเวลาสิ้นสุด');
+    return;
+  }
+  startJob(`/api/job/start-gif-range?station=${encodeURIComponent(station)}&start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}&step=${s}`);
 }
 function makeCombined(){
   const h=document.getElementById('hours').value;
@@ -2062,6 +2150,137 @@ def _run_combined_gif_job(job_id: str, hours: int, step: int):
             message="สร้าง GIF เปรียบเทียบไม่สำเร็จ",
             error=str(e),
         )
+
+
+def parse_local_bkk_datetime(value: str):
+    try:
+        dt = datetime.fromisoformat(value)
+    except Exception:
+        raise HTTPException(400, "รูปแบบเวลาต้องเป็น YYYY-MM-DDTHH:MM")
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=BKK)
+    else:
+        dt = dt.astimezone(BKK)
+    return dt
+
+
+def build_gif_range(station: str, start_dt: datetime, end_hour_dt: datetime, step: int, progress_cb=None):
+    if progress_cb:
+        progress_cb(3, f"กำลังเตรียม CCTV {station} ตามช่วงเวลาที่เลือก...")
+    tasks, cam = build_inclusive_hour_range_tasks(station, start_dt, end_hour_dt, step)
+    if len(tasks) < 2:
+        raise RuntimeError("ช่วงเวลาที่เลือกมีภาพ CCTV ไม่เพียงพอ")
+
+    if progress_cb:
+        progress_cb(10, "กำลังอ่านข้อมูลระดับน้ำ...")
+    history, _ = fetch_water_history(station)
+
+    results, diagnostics = extract_frames_for_tasks(
+        tasks,
+        progress_cb=progress_cb,
+        progress_start=15,
+        progress_end=75,
+        progress_label=f"{station} ดาวน์โหลด/สกัดเฟรม",
+    )
+    if len(results) < 2:
+        raise RuntimeError(
+            "ดึงเฟรมจากวิดีโอได้ไม่พอ | "
+            + json.dumps(diagnostics[-8:], ensure_ascii=False, default=str)
+        )
+
+    frames = []
+    for slot, b in results:
+        level, level_dt = playback_hour_water_level(history, slot)
+        fr = render_report_frame(b, station, slot, level, GIF_SIZE, water_level_dt=level_dt)
+        frames.append(fr.quantize(colors=128, method=Image.Quantize.MEDIANCUT))
+
+    if progress_cb:
+        progress_cb(94, "กำลังเข้ารหัส GIF...")
+    path = temp_path(".gif")
+    frames[0].save(
+        path,
+        save_all=True,
+        append_images=frames[1:],
+        duration=GIF_DURATION_MS,
+        loop=0,
+        optimize=False,
+        disposal=2,
+    )
+    if progress_cb:
+        progress_cb(100, "สร้าง GIF เสร็จแล้ว")
+    return path, len(frames), len(tasks), cam
+
+
+def _run_gif_range_job(job_id: str, station: str, start_dt: datetime, end_hour_dt: datetime, step: int):
+    try:
+        cb = job_progress_callback(job_id)
+        update_job(job_id, status="running", progress=1, message="เริ่มงานสร้าง GIF ตามช่วงเวลา...")
+        path, frames, tasks, cam = build_gif_range(
+            station,
+            start_dt,
+            end_hour_dt,
+            step,
+            progress_cb=cb,
+        )
+        filename = (
+            f"{station.replace('.','')}_"
+            f"{start_dt:%Y%m%d_%H%M}-"
+            f"{end_hour_dt:%Y%m%d_%H}59_"
+            f"{frames}frames.gif"
+        )
+        update_job(
+            job_id,
+            status="done",
+            progress=100,
+            message=f"สร้างเสร็จแล้ว {frames} เฟรม พร้อมดาวน์โหลด",
+            path=path,
+            filename=filename,
+            meta={"frames": frames, "tasks": tasks, "cam": cam},
+        )
+    except Exception as e:
+        update_job(job_id, status="error", message="สร้าง GIF ไม่สำเร็จ", error=str(e))
+
+
+@app.get("/api/job/start-gif-range")
+def api_job_start_gif_range(
+    station: str = Query(...),
+    start: str = Query(..., description="YYYY-MM-DDTHH:MM เวลาไทย"),
+    end: str = Query(..., description="YYYY-MM-DDTHH:MM เวลาไทย; ชั่วโมงปลายทาง inclusive"),
+    step: int = Query(15),
+):
+    station = validate_station(station)
+    if step not in (5, 10, 15, 30):
+        raise HTTPException(400, "step ต้องเป็น 5, 10, 15 หรือ 30 นาที")
+    start_dt = parse_local_bkk_datetime(start)
+    end_dt = parse_local_bkk_datetime(end)
+    if end_dt < start_dt:
+        raise HTTPException(400, "end ต้องไม่น้อยกว่า start")
+    # guard: inclusive ending hour
+    total_minutes = ((end_dt.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)) - start_dt).total_seconds() / 60
+    estimated = math.ceil(total_minutes / step)
+    if estimated > 240:
+        raise HTTPException(400, "จำนวนเฟรมมากเกินไปสำหรับ Render Free")
+
+    job_id = create_job("gif-range", {
+        "station": station,
+        "start": start_dt.isoformat(),
+        "end_inclusive_hour": end_dt.isoformat(),
+        "step": step,
+    })
+    t = threading.Thread(
+        target=_run_gif_range_job,
+        args=(job_id, station, start_dt, end_dt, step),
+        daemon=True,
+    )
+    t.start()
+    return {
+        "ok": True,
+        "job_id": job_id,
+        "effective_range": {
+            "start": start_dt.isoformat(),
+            "end_approximately": (end_dt.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1, seconds=-1)).isoformat(),
+        },
+    }
 
 
 @app.get("/api/job/start-gif")
