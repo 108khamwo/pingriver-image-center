@@ -58,7 +58,7 @@ def make_session():
     )
     s.mount("https://", HTTPAdapter(max_retries=retry))
     s.headers.update({
-        "User-Agent": "Mozilla/5.0 (PingRiverImageCenter/7.0)",
+        "User-Agent": "Mozilla/5.0 (PingRiverImageCenter/8.0)",
         "Accept": "*/*",
         "Referer": "https://appserv.net/pingriver.php",
     })
@@ -535,36 +535,202 @@ def download_playback_video(urls, station: str):
     raise RuntimeError(" | ".join(tried[-4:]) if tried else (last_err or "download video failed"))
 
 
-def extract_frame_from_local_video(video_path: str, offset_seconds: int):
+def probe_video_duration(video_path: str):
+    """
+    อ่าน duration จริงของ MP4 ด้วย ffprobe
+    hourly/*.mp4 อาจไม่ได้ยาว 3600 วินาทีจริง
+    """
     cmd = [
-        "ffmpeg",
-        "-hide_banner",
-        "-loglevel", "error",
-        "-y",
-        "-ss", str(int(offset_seconds)),
-        "-i", video_path,
-        "-frames:v", "1",
-        "-f", "image2pipe",
-        "-vcodec", "mjpeg",
-        "pipe:1",
+        "ffprobe",
+        "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        video_path,
     ]
     res = subprocess.run(
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        timeout=120,
+        timeout=60,
     )
-    if res.returncode == 0 and res.stdout:
-        return res.stdout
-    err = res.stderr.decode("utf-8", "ignore")[:800]
-    raise RuntimeError(err or "ffmpeg extract local frame failed")
+    if res.returncode != 0:
+        err = res.stderr.decode("utf-8", "ignore")[:800]
+        raise RuntimeError(f"ffprobe failed: {err}")
+    try:
+        duration = float(res.stdout.decode("utf-8", "ignore").strip())
+    except Exception:
+        duration = 0.0
+    if duration <= 0:
+        raise RuntimeError("ffprobe duration <= 0")
+    return duration
+
+
+def extract_frame_from_local_video(video_path: str, target_seconds: float):
+    """
+    ลอง seek 2 รูปแบบ:
+    1) accurate seek: -i ก่อน -ss
+    2) fast seek: -ss ก่อน -i
+    """
+    target_seconds = max(0.0, float(target_seconds))
+    attempts = [
+        [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-i", video_path,
+            "-ss", f"{target_seconds:.3f}",
+            "-frames:v", "1",
+            "-f", "image2pipe",
+            "-vcodec", "mjpeg",
+            "pipe:1",
+        ],
+        [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-ss", f"{target_seconds:.3f}",
+            "-i", video_path,
+            "-frames:v", "1",
+            "-f", "image2pipe",
+            "-vcodec", "mjpeg",
+            "pipe:1",
+        ],
+    ]
+
+    last = None
+    for cmd in attempts:
+        res = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=120,
+        )
+        if res.returncode == 0 and res.stdout:
+            return res.stdout
+        last = {
+            "returncode": res.returncode,
+            "stderr": res.stderr.decode("utf-8", "ignore")[:800],
+            "stdout_len": len(res.stdout),
+            "target_seconds": target_seconds,
+        }
+
+    raise RuntimeError(
+        "ffmpeg extract local frame failed: "
+        + json.dumps(last or {}, ensure_ascii=False)
+    )
+
+
+def wallclock_offset_to_video_seconds(offset_seconds: int, duration: float):
+    """
+    map นาทีภายในชั่วโมง -> ตำแหน่งจริงใน MP4
+
+    ตัวอย่าง:
+      นาที 30 = 1800/3600 = 50% ของไฟล์
+    ไม่สมมติว่า MP4 ยาว 3600 วินาที
+    """
+    fraction = max(0.0, min(0.999, float(offset_seconds) / 3600.0))
+
+    # หลีกเลี่ยงเฟรมแรกที่อาจยังดำ และท้ายไฟล์ที่ชน EOF
+    if fraction <= 0:
+        return min(max(0.15, duration * 0.002), max(0.0, duration - 0.15))
+
+    target = duration * fraction
+    if duration > 0.5:
+        target = min(target, duration - 0.20)
+    return max(0.0, target)
+
+
+def extract_frames_for_tasks(tasks):
+    """
+    ดาวน์โหลด MP4 ต่อชั่วโมงเพียงครั้งเดียว
+    แล้วสกัดหลายเฟรมจากไฟล์ local ตามสัดส่วนเวลา
+
+    return:
+      results = [(slot, jpeg_bytes), ...]
+      diagnostics = [...]
+    """
+    if not tasks:
+        return [], []
+
+    groups = {}
+    for task in tasks:
+        groups.setdefault(
+            (task["station"], task["rel_file"]),
+            {
+                "station": task["station"],
+                "rel_file": task["rel_file"],
+                "urls": task["urls"],
+                "tasks": [],
+            },
+        )["tasks"].append(task)
+
+    results = []
+    diagnostics = []
+
+    # ทำทีละไฟล์เพื่อไม่ให้ Render Free ใช้ disk/network หนักเกิน
+    for (_, _), group in sorted(
+        groups.items(),
+        key=lambda kv: min(t["slot"] for t in kv[1]["tasks"])
+    ):
+        video_path = None
+        try:
+            video_path = download_playback_video(
+                group["urls"],
+                group["station"],
+            )
+            size_bytes = os.path.getsize(video_path)
+            duration = probe_video_duration(video_path)
+
+            ok_count = 0
+            for task in sorted(group["tasks"], key=lambda x: x["slot"]):
+                target = wallclock_offset_to_video_seconds(
+                    task["offset"],
+                    duration,
+                )
+                try:
+                    frame = extract_frame_from_local_video(video_path, target)
+                    results.append((task["slot"], frame))
+                    ok_count += 1
+                except Exception as e:
+                    diagnostics.append({
+                        "station": group["station"],
+                        "file": group["rel_file"],
+                        "slot": task["slot"].isoformat(),
+                        "wall_offset": task["offset"],
+                        "duration": duration,
+                        "target": target,
+                        "error": str(e),
+                    })
+
+            diagnostics.append({
+                "station": group["station"],
+                "file": group["rel_file"],
+                "size_bytes": size_bytes,
+                "duration": duration,
+                "requested_frames": len(group["tasks"]),
+                "ok_frames": ok_count,
+            })
+
+        except Exception as e:
+            diagnostics.append({
+                "station": group["station"],
+                "file": group["rel_file"],
+                "error": str(e),
+            })
+        finally:
+            if video_path:
+                remove_file(video_path)
+
+    results.sort(key=lambda x: x[0])
+    return results, diagnostics
 
 
 def ffmpeg_extract_frame(urls, offset_seconds: int, station: str):
+    """
+    compatibility helper — ใช้เฉพาะ debug/legacy
+    """
     video_path = None
     try:
         video_path = download_playback_video(urls, station)
-        return extract_frame_from_local_video(video_path, offset_seconds)
+        duration = probe_video_duration(video_path)
+        target = wallclock_offset_to_video_seconds(offset_seconds, duration)
+        return extract_frame_from_local_video(video_path, target)
     finally:
         if video_path:
             remove_file(video_path)
@@ -797,13 +963,13 @@ def build_gif(station: str, hours: int, step: int):
         raise RuntimeError("จำนวนช่วงเวลาที่สร้างได้ไม่พอสำหรับทำ GIF")
 
     history, _ = fetch_water_history(station)
-    results = []
-    with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, max(2, len(tasks)))) as ex:
-        futs = [ex.submit(extract_task_frame, t) for t in tasks]
-        for f in as_completed(futs):
-            results.append(f.result())
 
-    results.sort(key=lambda x: x[0])
+    results, diagnostics = extract_frames_for_tasks(tasks)
+    if len(results) < 2:
+        raise RuntimeError(
+            "ดึงเฟรมจากวิดีโอได้ไม่พอสำหรับทำ GIF | "
+            + json.dumps(diagnostics[-8:], ensure_ascii=False, default=str)
+        )
 
     frames = []
     for slot, b in results:
@@ -812,9 +978,6 @@ def build_gif(station: str, hours: int, step: int):
         fr = fr.quantize(colors=128, method=Image.Quantize.MEDIANCUT)
         frames.append(fr)
 
-    if len(frames) < 2:
-        raise RuntimeError("ดึงเฟรมจากวิดีโอได้ไม่พอสำหรับทำ GIF")
-
     path = temp_path(".gif")
     frames[0].save(
         path,
@@ -825,47 +988,79 @@ def build_gif(station: str, hours: int, step: int):
         optimize=False,
         disposal=2,
     )
-    return path, len(frames), len(tasks), cam
-
+    return path, len(frames), len(tasks), {
+        **cam,
+        "frame_diagnostics": diagnostics[-20:],
+    }
 
 def build_combined_gif(hours: int, step: int):
     p1_tasks, p1_cam = build_slot_tasks("P.1", hours, step)
     p67_tasks, p67_cam = build_slot_tasks("P.67", hours, step)
+
     map1 = {t["slot"]: t for t in p1_tasks}
     map67 = {t["slot"]: t for t in p67_tasks}
     common_slots = sorted(set(map1.keys()) & set(map67.keys()))
+
     if len(common_slots) < 2:
-        raise RuntimeError("ช่วงเวลาที่ P.1 และ P.67 ซ้อนกันมีไม่พอสำหรับ GIF เปรียบเทียบ")
+        raise RuntimeError(
+            "ช่วงเวลาที่ P.1 และ P.67 ซ้อนกันมีไม่พอสำหรับ GIF เปรียบเทียบ"
+        )
+
+    # เอาเฉพาะ task ที่อยู่ใน common slots
+    p1_common = [map1[s] for s in common_slots]
+    p67_common = [map67[s] for s in common_slots]
+
+    p1_results, p1_diag = extract_frames_for_tasks(p1_common)
+    p67_results, p67_diag = extract_frames_for_tasks(p67_common)
+
+    bytes1 = {slot: b for slot, b in p1_results}
+    bytes67 = {slot: b for slot, b in p67_results}
 
     h1, _ = fetch_water_history("P.1")
     h67, _ = fetch_water_history("P.67")
 
-    tasks = []
-    for slot in common_slots:
-        tasks.append(("P.1", slot, map1[slot]))
-        tasks.append(("P.67", slot, map67[slot]))
-
-    extracted = {}
-    with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, max(2, len(tasks)))) as ex:
-        fut_map = {ex.submit(extract_task_frame, t): (station, slot) for station, slot, t in tasks}
-        for fut in as_completed(fut_map):
-            station, slot = fut_map[fut]
-            slot2, b = fut.result()
-            extracted[(station, slot2)] = b
-
     frames = []
     for slot in common_slots:
-        if ("P.1", slot) not in extracted or ("P.67", slot) not in extracted:
+        if slot not in bytes1 or slot not in bytes67:
             continue
-        left = render_report_frame(extracted[("P.1", slot)], "P.1", slot, nearest_water_level(h1, slot), GIF_SIZE)
-        right = render_report_frame(extracted[("P.67", slot)], "P.67", slot, nearest_water_level(h67, slot), GIF_SIZE)
-        canvas = Image.new("RGB", (GIF_SIZE * 2, GIF_SIZE), (10, 20, 34))
+
+        left = render_report_frame(
+            bytes1[slot],
+            "P.1",
+            slot,
+            nearest_water_level(h1, slot),
+            GIF_SIZE,
+        )
+        right = render_report_frame(
+            bytes67[slot],
+            "P.67",
+            slot,
+            nearest_water_level(h67, slot),
+            GIF_SIZE,
+        )
+
+        canvas = Image.new(
+            "RGB",
+            (GIF_SIZE * 2, GIF_SIZE),
+            (10, 20, 34),
+        )
         canvas.paste(left, (0, 0))
         canvas.paste(right, (GIF_SIZE, 0))
-        frames.append(canvas.quantize(colors=128, method=Image.Quantize.MEDIANCUT))
+        frames.append(
+            canvas.quantize(
+                colors=128,
+                method=Image.Quantize.MEDIANCUT,
+            )
+        )
 
     if len(frames) < 2:
-        raise RuntimeError("สร้าง GIF เปรียบเทียบไม่สำเร็จ")
+        raise RuntimeError(
+            "สร้าง GIF เปรียบเทียบไม่สำเร็จ | "
+            + json.dumps({
+                "p1": p1_diag[-6:],
+                "p67": p67_diag[-6:],
+            }, ensure_ascii=False, default=str)
+        )
 
     path = temp_path(".gif")
     frames[0].save(
@@ -877,7 +1072,16 @@ def build_combined_gif(hours: int, step: int):
         optimize=False,
         disposal=2,
     )
-    return path, len(frames), len(common_slots), {"P.1": p1_cam, "P.67": p67_cam}
+
+    return path, len(frames), len(common_slots), {
+        "P.1": p1_cam,
+        "P.67": p67_cam,
+        "diagnostics": {
+            "P.1": p1_diag[-20:],
+            "P.67": p67_diag[-20:],
+        },
+    }
+
 
 
 HTML = """
@@ -886,7 +1090,7 @@ HTML = """
 <head>
 <meta charset=\"utf-8\">
 <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">
-<title>Ping River Image Center v7</title>
+<title>Ping River Image Center v8</title>
 <style>
 :root{color-scheme:dark}
 *{box-sizing:border-box}
@@ -910,7 +1114,7 @@ select{background:#0a1728;color:white;border:1px solid #36506c;padding:9px;borde
 </head>
 <body>
 <div class=\"wrap\">
-  <h1>🌊 Ping River Image Center v7</h1>
+  <h1>🌊 Ping River Image Center v8</h1>
   <div class=\"sub\">เวอร์ชันนี้ใช้ CCTV Playback แบบวิดีโอรายชั่วโมงเพื่อสร้าง GIF จากภาพจริงย้อนหลัง</div>
 
   <div class=\"grid\">
@@ -1102,6 +1306,55 @@ def history_check(station: str = Query(...), hours: int = Query(24, ge=1, le=72)
         }
     except Exception as e:
         raise HTTPException(502, f"ตรวจ playback ไม่สำเร็จ: {e}")
+
+
+@app.get("/api/debug/video-probe")
+def api_debug_video_probe(station: str = Query(...)):
+    station = validate_station(station)
+    tasks, cam = build_slot_tasks(station, hours=1, step=30)
+    if not tasks:
+        raise HTTPException(502, "ไม่มี task สำหรับทดสอบ")
+
+    # เลือกไฟล์แรกที่มี
+    task = tasks[0]
+    video_path = None
+    try:
+        video_path = download_playback_video(task["urls"], station)
+        size_bytes = os.path.getsize(video_path)
+        duration = probe_video_duration(video_path)
+
+        tests = []
+        for fraction in (0.0, 0.25, 0.5, 0.75):
+            target = wallclock_offset_to_video_seconds(
+                int(fraction * 3600),
+                duration,
+            )
+            try:
+                b = extract_frame_from_local_video(video_path, target)
+                tests.append({
+                    "fraction": fraction,
+                    "target_seconds": target,
+                    "jpeg_bytes": len(b),
+                    "ok": True,
+                })
+            except Exception as e:
+                tests.append({
+                    "fraction": fraction,
+                    "target_seconds": target,
+                    "ok": False,
+                    "error": str(e),
+                })
+
+        return {
+            "station": station,
+            "file": task["rel_file"],
+            "size_bytes": size_bytes,
+            "duration_seconds": duration,
+            "tests": tests,
+        }
+    finally:
+        if video_path:
+            remove_file(video_path)
 
 
 @app.get("/api/debug/playback-url-sample")

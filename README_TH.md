@@ -1,4 +1,4 @@
-# Ping River Image Center v7
+# Ping River Image Center v8
 
 เวอร์ชันนี้อัปเดตให้ใช้ CCTV Playback แบบวิดีโอรายชั่วโมง (`hourly/*.mp4`) เพื่อสร้าง GIF จากภาพจริงย้อนหลัง
 
@@ -77,3 +77,16 @@ v7 จึงเปลี่ยนวิธี:
 เพิ่ม debug:
 - `/api/debug/playback-url-sample?station=P.1`
 - `/api/debug/playback-url-sample?station=P.67`
+
+
+## แก้ไข v8 — seek ตาม duration จริงของ MP4
+v7 ดาวน์โหลด MP4 ได้แล้ว แต่ใช้ offset 0/900/1800/2700 วินาทีตรง ๆ
+ซึ่งอาจเกิน duration จริงของวิดีโอ playback
+
+v8:
+- ใช้ ffprobe อ่าน duration จริง
+- map นาที 0/15/30/45 เป็น 0/25/50/75% ของไฟล์
+- ลอง accurate seek และ fast seek
+- ดาวน์โหลด MP4 แต่ละชั่วโมงเพียงครั้งเดียว
+- ข้ามเฟรมเสียบางเฟรมได้ ไม่ทำให้ทั้งงานล้มทันที
+- เพิ่ม `/api/debug/video-probe?station=P.1`
