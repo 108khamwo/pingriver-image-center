@@ -64,7 +64,7 @@ def make_session():
     )
     s.mount("https://", HTTPAdapter(max_retries=retry))
     s.headers.update({
-        "User-Agent": "Mozilla/5.0 (PingRiverImageCenter/20.0)",
+        "User-Agent": "Mozilla/5.0 (PingRiverImageCenter/23.0)",
         "Accept": "*/*",
         "Referer": "https://appserv.net/pingriver.php",
     })
@@ -1228,14 +1228,17 @@ def render_report_frame(cctv_bytes: bytes, station: str, captured_at: datetime, 
     return canvas
 
 def latest_png(station: str):
+    """
+    คงชื่อฟังก์ชันเดิมไว้ แต่ผลลัพธ์เป็น JPG ตามการใช้งานล่าสุด
+    """
     url, _ = latest_cache_jpg(station)
     dt = camera_timestamp_from_cache_url(url) or now_bkk()
     history, _ = fetch_water_history(station)
     level, level_dt = hourly_water_level(history, dt)
     b = fetch_bytes(url + f"?t={int(now_bkk().timestamp())}")
-    img = render_report_frame(b, station, dt, level, PNG_SIZE, water_level_dt=level_dt)
-    path = temp_path(".png")
-    img.save(path, "PNG", optimize=True)
+    img = render_report_frame(b, station, dt, level, PNG_SIZE, water_level_dt=level_dt).convert("RGB")
+    path = temp_path(".jpg")
+    img.save(path, "JPEG", quality=92, optimize=True)
     return path
 
 
@@ -1361,12 +1364,14 @@ def build_slot_tasks(station: str, hours: int, step: int):
     # newest_hour คือเวลาเริ่มต้นของไฟล์ล่าสุดที่มีจริง
     newest_hour = available_hours[-1]
 
-    # end_boundary คือเวลาสิ้นสุดของไฟล์ล่าสุด
-    # เช่น 11.mp4 => 12:00
+    # ชั่วโมงปลายทางรวมทั้งชั่วโมงล่าสุดที่มีจริง
+    # เช่น newest_hour = 13:00 หมายถึงรวมไฟล์ 13.mp4 จนถึงประมาณ 13:59
     end_boundary = newest_hour + timedelta(hours=1)
 
-    # ขอย้อนหลัง N ชั่วโมง โดย anchor ที่ playback ล่าสุด
-    start_boundary = end_boundary - timedelta(hours=hours)
+    # "ย้อนหลัง N ชั่วโมง" ให้ตีความชั่วโมงต้นทางถึงชั่วโมงปลายทางแบบ inclusive
+    # ตัวอย่าง hours=1 และ newest_hour=13:00
+    # => ดึงตั้งแต่ 12:00 ถึงประมาณ 13:59
+    start_boundary = newest_hour - timedelta(hours=hours)
 
     tasks = []
     cursor = start_boundary
@@ -1593,7 +1598,7 @@ HTML = """
 <head>
 <meta charset=\"utf-8\">
 <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">
-<title>Ping River Image Center v20</title>
+<title>Ping River Image Center v23</title>
 <style>
 :root{color-scheme:dark}
 *{box-sizing:border-box}
@@ -1620,7 +1625,7 @@ select{background:#0a1728;color:white;border:1px solid #36506c;padding:9px;borde
 </head>
 <body>
 <div class=\"wrap\">
-  <h1>🌊 Ping River Image Center v20</h1>
+  <h1>🌊 Ping River Image Center v23</h1>
   <div class=\"sub\">เวอร์ชันนี้ใช้ CCTV Playback แบบวิดีโอรายชั่วโมงเพื่อสร้าง GIF จากภาพจริงย้อนหลัง</div>
 
   <div class=\"grid\">
@@ -1665,17 +1670,13 @@ select{background:#0a1728;color:white;border:1px solid #36506c;padding:9px;borde
         <select id=\"step\">
           <option value=\"5\">5 นาที</option>
           <option value=\"10\">10 นาที</option>
-          <option value=\"15\" selected>15 นาที</option>
+          <option value=\"15\">15 นาที</option>
           <option value=\"30\">30 นาที</option>
+          <option value=\"60\" selected>1 ชั่วโมง</option>
         </select>
       </label>
     </div>
-    <div class=\"row\" style=\"margin-top:14px\">
-      <label>เริ่ม <input type=\"datetime-local\" id=\"rangeStart\" style=\"background:#0a1728;color:white;border:1px solid #36506c;padding:9px;border-radius:9px\"></label>
-      <label>ถึงชั่วโมง <input type=\"datetime-local\" id=\"rangeEnd\" style=\"background:#0a1728;color:white;border:1px solid #36506c;padding:9px;border-radius:9px\"></label>
-      <button class=\"alt\" onclick=\"makeGifRange('P.1')\">GIF P.1 ตามช่วง</button>
-      <button class=\"alt\" onclick=\"makeGifRange('P.67')\">GIF P.67 ตามช่วง</button>
-    </div>
+    <div class=\"muted\">ค่าเริ่มต้น: ย้อนหลัง 24 ชั่วโมง และดึงภาพทุก 1 ชั่วโมง | ระบบเลือกช่วง CCTV ให้อัตโนมัติ โดยรวมชั่วโมงปลายทางทั้งชั่วโมง เช่น 12:00–13:59</div>
     <div class=\"row\">
       <button onclick=\"makeGif('P.1')\">GIF P.1</button>
       <button onclick=\"makeGif('P.67')\">GIF P.67</button>
@@ -1721,8 +1722,43 @@ async function loadStatus(station){
 function refreshCamera(station){
   const card=document.querySelector(`[data-station="${station}"]`);
   const img=card.querySelector('img');
+  const status=document.getElementById('status-'+id(station));
+  status.textContent='กำลังรีเฟรชภาพ CCTV...';
+  img.onload = () => {
+    status.textContent='รีเฟรชภาพ CCTV สำเร็จ';
+    loadStatus(station);
+  };
+  img.onerror = () => {
+    status.textContent='รีเฟรชภาพ CCTV ไม่สำเร็จ';
+  };
   img.src='/camera/latest?station='+encodeURIComponent(station)+'&t='+Date.now();
-  loadStatus(station);
+}
+async function saveLatest(station){
+  const status=document.getElementById('status-'+id(station));
+  status.textContent='กำลังสร้างและบันทึกภาพล่าสุด...';
+  try{
+    const r = await fetch('/download/jpg?station='+encodeURIComponent(station));
+    if(!r.ok){
+      const txt = await r.text();
+      throw new Error(txt || 'download failed');
+    }
+    const blob = await r.blob();
+    const cd = r.headers.get('Content-Disposition') || '';
+    let filename = `${station.replace('.', '')}_latest.jpg`;
+    const m = cd.match(/filename="?([^";]+)"?/i);
+    if(m && m[1]) filename = m[1];
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+    status.textContent='บันทึกภาพล่าสุดสำเร็จ';
+  }catch(e){
+    status.textContent='บันทึกภาพล่าสุดไม่สำเร็จ: ' + e.message;
+  }
 }
 async function startJob(url){
   if(currentJobPoll){
@@ -1743,16 +1779,6 @@ function makeGif(station){
   const h=document.getElementById('hours').value;
   const s=document.getElementById('step').value;
   startJob(`/api/job/start-gif?station=${encodeURIComponent(station)}&hours=${h}&step=${s}`);
-}
-function makeGifRange(station){
-  const start=document.getElementById('rangeStart').value;
-  const end=document.getElementById('rangeEnd').value;
-  const s=document.getElementById('step').value;
-  if(!start || !end){
-    setWorkProgress(0,'กรุณาเลือกเวลาเริ่มและเวลาสิ้นสุด');
-    return;
-  }
-  startJob(`/api/job/start-gif-range?station=${encodeURIComponent(station)}&start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}&step=${s}`);
 }
 function makeCombined(){
   const h=document.getElementById('hours').value;
@@ -1880,7 +1906,7 @@ def history_check(station: str = Query(...), hours: int = Query(24, ge=1, le=72)
 
         latest = dts[-1]
         end_boundary = latest + timedelta(hours=1)
-        cutoff = end_boundary - timedelta(hours=hours)
+        cutoff = latest - timedelta(hours=hours)
 
         in_period = [
             x for x in dts
@@ -2091,16 +2117,22 @@ def camera_latest(station: str = Query(...)):
         raise HTTPException(502, f"โหลด CCTV ไม่สำเร็จ: {e}")
 
 
-@app.get("/download/png")
-def download_png(station: str = Query(...)):
+@app.get("/download/jpg")
+def download_jpg(station: str = Query(...)):
     station = validate_station(station)
     try:
         path = latest_png(station)
-        filename = f"{station.replace('.','')}_latest_{now_bkk():%Y%m%d_%H%M}.png"
-        return FileResponse(path, media_type="image/png", filename=filename,
+        filename = f"{station.replace('.','')}_latest_{now_bkk():%Y%m%d_%H%M}.jpg"
+        return FileResponse(path, media_type="image/jpeg", filename=filename,
                             background=BackgroundTask(remove_file, path))
     except Exception as e:
-        raise HTTPException(502, f"สร้าง PNG ไม่สำเร็จ: {e}")
+        raise HTTPException(502, f"บันทึกภาพ JPG ไม่สำเร็จ: {e}")
+
+
+@app.get("/download/png")
+def download_png(station: str = Query(...)):
+    # alias เดิมเพื่อ backward compatibility
+    return download_jpg(station)
 
 
 
@@ -2246,11 +2278,11 @@ def api_job_start_gif_range(
     station: str = Query(...),
     start: str = Query(..., description="YYYY-MM-DDTHH:MM เวลาไทย"),
     end: str = Query(..., description="YYYY-MM-DDTHH:MM เวลาไทย; ชั่วโมงปลายทาง inclusive"),
-    step: int = Query(15),
+    step: int = Query(60),
 ):
     station = validate_station(station)
-    if step not in (5, 10, 15, 30):
-        raise HTTPException(400, "step ต้องเป็น 5, 10, 15 หรือ 30 นาที")
+    if step not in (5, 10, 15, 30, 60):
+        raise HTTPException(400, "step ต้องเป็น 5, 10, 15, 30 หรือ 60 นาที")
     start_dt = parse_local_bkk_datetime(start)
     end_dt = parse_local_bkk_datetime(end)
     if end_dt < start_dt:
@@ -2287,12 +2319,12 @@ def api_job_start_gif_range(
 def api_job_start_gif(
     station: str = Query(...),
     hours: int = Query(24, ge=1, le=72),
-    step: int = Query(15),
+    step: int = Query(60),
 ):
     station = validate_station(station)
-    if step not in (5, 10, 15, 30):
-        raise HTTPException(400, "step ต้องเป็น 5, 10, 15 หรือ 30 นาที")
-    estimated = math.ceil(hours * 60 / step)
+    if step not in (5, 10, 15, 30, 60):
+        raise HTTPException(400, "step ต้องเป็น 5, 10, 15, 30 หรือ 60 นาที")
+    estimated = math.ceil((hours + 1) * 60 / step)
     if estimated > 240:
         raise HTTPException(400, "จำนวนเฟรมมากเกินไปสำหรับ Render Free กรุณาเพิ่ม step หรือลดชั่วโมง")
     job_id = create_job("gif", {"station": station, "hours": hours, "step": step})
@@ -2304,10 +2336,10 @@ def api_job_start_gif(
 @app.get("/api/job/start-gif-combined")
 def api_job_start_gif_combined(
     hours: int = Query(24, ge=1, le=72),
-    step: int = Query(15),
+    step: int = Query(60),
 ):
-    if step not in (5, 10, 15, 30):
-        raise HTTPException(400, "step ต้องเป็น 5, 10, 15 หรือ 30 นาที")
+    if step not in (5, 10, 15, 30, 60):
+        raise HTTPException(400, "step ต้องเป็น 5, 10, 15, 30 หรือ 60 นาที")
     estimated = math.ceil(hours * 60 / step)
     if estimated > 120:
         raise HTTPException(400, "GIF เปรียบเทียบใช้ทรัพยากรมาก กรุณาเลือก step มากขึ้นหรือลดชั่วโมง")
@@ -2356,12 +2388,12 @@ def api_job_download(job_id: str = Query(...)):
 def download_gif(
     station: str = Query(...),
     hours: int = Query(24, ge=1, le=72),
-    step: int = Query(15),
+    step: int = Query(60),
 ):
     station = validate_station(station)
-    if step not in (5, 10, 15, 30):
-        raise HTTPException(400, "step ต้องเป็น 5, 10, 15 หรือ 30 นาที")
-    estimated = math.ceil(hours * 60 / step)
+    if step not in (5, 10, 15, 30, 60):
+        raise HTTPException(400, "step ต้องเป็น 5, 10, 15, 30 หรือ 60 นาที")
+    estimated = math.ceil((hours + 1) * 60 / step)
     if estimated > 240:
         raise HTTPException(400, "จำนวนเฟรมมากเกินไปสำหรับ Render Free กรุณาเพิ่ม step หรือลดชั่วโมง")
     try:
@@ -2375,8 +2407,8 @@ def download_gif(
 
 @app.get("/download/gif-combined")
 def download_gif_combined(hours: int = Query(24, ge=1, le=72), step: int = Query(15)):
-    if step not in (5, 10, 15, 30):
-        raise HTTPException(400, "step ต้องเป็น 5, 10, 15 หรือ 30 นาที")
+    if step not in (5, 10, 15, 30, 60):
+        raise HTTPException(400, "step ต้องเป็น 5, 10, 15, 30 หรือ 60 นาที")
     estimated = math.ceil(hours * 60 / step)
     if estimated > 120:
         raise HTTPException(400, "GIF เปรียบเทียบใช้ทรัพยากรมาก กรุณาเลือก step มากขึ้นหรือลดชั่วโมง")
