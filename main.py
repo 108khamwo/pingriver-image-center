@@ -64,7 +64,7 @@ def make_session():
     )
     s.mount("https://", HTTPAdapter(max_retries=retry))
     s.headers.update({
-        "User-Agent": "Mozilla/5.0 (PingRiverImageCenter/24.0)",
+        "User-Agent": "Mozilla/5.0 (PingRiverImageCenter/26.0)",
         "Accept": "*/*",
         "Referer": "https://appserv.net/pingriver.php",
     })
@@ -867,7 +867,7 @@ def extract_frames_for_tasks(tasks, progress_cb=None, progress_start=0, progress
     for idx, ((_, _), group) in enumerate(ordered_groups, start=1):
         if progress_cb:
             group_pct = ((idx - 1) / total_groups) * 100.0
-            progress_cb(group_pct, f"{progress_label} {idx}/{total_groups}: {group['rel_file']}")
+            progress_cb(group_pct, f"กำลังประมวลผล {idx}/{total_groups}")
         video_path = None
         try:
             video_path = download_playback_video(
@@ -908,7 +908,7 @@ def extract_frames_for_tasks(tasks, progress_cb=None, progress_start=0, progress
             })
             if progress_cb:
                 group_pct = (idx / total_groups) * 100.0
-                progress_cb(group_pct, f"{progress_label} {idx}/{total_groups}: เสร็จ {group['rel_file']}")
+                progress_cb(group_pct, f"ประมวลผลแล้ว {idx}/{total_groups}")
 
         except Exception as e:
             diagnostics.append({
@@ -1117,38 +1117,42 @@ def render_report_frame(cctv_bytes: bytes, station: str, captured_at: datetime, 
         canvas.paste(image_panel, (img_left, img_top))
 
         if zoom_timestamp:
-            crop_w = max(120, int(orig.width * 0.34))
-            crop_h = max(26, int(orig.height * 0.12))
+            # ขยายบริเวณวันที่เวลา มุมซ้ายบน แล้ววาง popup ไว้ใต้ของจริงใกล้ ๆ กัน
+            crop_w = max(150, int(orig.width * 0.34))
+            crop_h = max(34, int(orig.height * 0.10))
             crop_w = min(crop_w, orig.width)
             crop_h = min(crop_h, orig.height)
             ts_crop = orig.crop((0, 0, crop_w, crop_h))
 
-            inset_w = int(image_box_w * 0.38)
-            inset_h = int(image_box_h * 0.13)
-            inset_x = img_right - inset_w - int(size * 0.02)
-            inset_y = img_top + int(size * 0.018)
+            inset_w = int(image_box_w * 0.44)
+            inset_h = int(image_box_h * 0.16)
+            inset_x = img_left + int(size * 0.035)
+            inset_y = img_top + int(size * 0.055)
 
             draw.rounded_rectangle(
-                (inset_x - 4, inset_y - 4, inset_x + inset_w + 4, inset_y + inset_h + 4),
+                (inset_x - 5, inset_y - 5, inset_x + inset_w + 5, inset_y + inset_h + 5),
                 radius=12,
                 fill=(8, 18, 32),
                 outline=(120, 180, 235),
                 width=2,
             )
 
+            # ใช้ contain + NEAREST เพื่อให้ตัวเลขใน overlay ใหญ่และคมขึ้น
             inset_img = ImageOps.contain(
                 ts_crop,
-                (inset_w, inset_h),
+                (inset_w - 10, inset_h - 10),
                 method=Image.Resampling.NEAREST,
             )
             inset_panel = Image.new("RGB", (inset_w, inset_h), (5, 10, 18))
-            inset_panel.paste(inset_img, ((inset_w - inset_img.width) // 2, (inset_h - inset_img.height) // 2))
+            px = max(0, (inset_w - inset_img.width) // 2)
+            py = max(0, (inset_h - inset_img.height) // 2)
+            inset_panel.paste(inset_img, (px, py))
             canvas.paste(inset_panel, (inset_x, inset_y))
 
-            # เส้นเชื่อมแบบ popup callout
-            callout_start = (img_left + int(size * 0.10), img_top + int(size * 0.04))
-            callout_mid = (img_left + int(size * 0.18), img_top + int(size * 0.03))
-            callout_end = (inset_x, inset_y + inset_h // 2)
+            # เส้นชี้สั้น ๆ จากต้นฉบับลงมาที่ popup
+            callout_start = (img_left + int(size * 0.085), img_top + int(size * 0.032))
+            callout_mid = (img_left + int(size * 0.095), img_top + int(size * 0.050))
+            callout_end = (inset_x + int(inset_w * 0.18), inset_y)
             draw.line([callout_start, callout_mid, callout_end], fill=(120, 180, 235), width=2)
     except Exception:
         draw.rectangle((img_left, img_top, img_right, img_bottom), fill=(40, 56, 74))
@@ -1402,17 +1406,17 @@ def extract_task_frame(task):
 
 def build_gif(station: str, hours: int, step: int, progress_cb=None):
     if progress_cb:
-        progress_cb(3, f"กำลังเตรียมรายการภาพย้อนหลัง {station}...")
+        progress_cb(3, f"กำลังเตรียมข้อมูล {station}...")
     tasks, cam = build_slot_tasks(station, hours, step)
     if len(tasks) < 2:
         raise RuntimeError("จำนวนช่วงเวลาที่สร้างได้ไม่พอสำหรับทำ GIF")
 
     if progress_cb:
-        progress_cb(10, "กำลังอ่านประวัติระดับน้ำ...")
+        progress_cb(10, "กำลังอ่านระดับน้ำ...")
     history, _ = fetch_water_history(station)
 
     if progress_cb:
-        progress_cb(15, "กำลังดาวน์โหลดวิดีโอและสกัดเฟรม...")
+        progress_cb(15, "กำลังดึงภาพ CCTV...")
     results, diagnostics = extract_frames_for_tasks(
         tasks,
         progress_cb=progress_cb,
@@ -1427,7 +1431,7 @@ def build_gif(station: str, hours: int, step: int, progress_cb=None):
         )
 
     if progress_cb:
-        progress_cb(80, "กำลังจัดวางภาพรายงาน...")
+        progress_cb(80, "กำลังจัดทำภาพ...")
     frames = []
     total_results = max(1, len(results))
     slots_only = [slot for slot, _ in results]
@@ -1451,7 +1455,7 @@ def build_gif(station: str, hours: int, step: int, progress_cb=None):
             progress_cb(80 + (idx / total_results) * 10, f"กำลังจัดวางภาพ {idx}/{total_results}")
 
     if progress_cb:
-        progress_cb(92, "กำลังเข้ารหัสไฟล์ GIF...")
+        progress_cb(92, "กำลังสร้าง GIF...")
     path = temp_path(".gif")
     frames[0].save(
         path,
@@ -1463,7 +1467,7 @@ def build_gif(station: str, hours: int, step: int, progress_cb=None):
         disposal=2,
     )
     if progress_cb:
-        progress_cb(100, "สร้าง GIF เสร็จแล้ว")
+        progress_cb(100, "เสร็จแล้ว")
     return path, len(frames), len(tasks), {
         **cam,
         "frame_diagnostics": diagnostics[-20:],
@@ -1471,7 +1475,7 @@ def build_gif(station: str, hours: int, step: int, progress_cb=None):
 
 def build_combined_gif(hours: int, step: int, progress_cb=None):
     if progress_cb:
-        progress_cb(3, "กำลังเตรียมรายการภาพย้อนหลังสำหรับ P.1 และ P.67...")
+        progress_cb(3, "กำลังเตรียมข้อมูลสำหรับ P.1 และ P.67...")
     p1_tasks, p1_cam = build_slot_tasks("P.1", hours, step)
     p67_tasks, p67_cam = build_slot_tasks("P.67", hours, step)
 
@@ -1488,14 +1492,14 @@ def build_combined_gif(hours: int, step: int, progress_cb=None):
     p67_common = [map67[s] for s in common_slots]
 
     if progress_cb:
-        progress_cb(10, "กำลังดึงเฟรมของ P.1...")
+        progress_cb(10, "กำลังดึงภาพ P.1...")
     p1_results, p1_diag = extract_frames_for_tasks(
         p1_common,
         progress_cb=job_progress_callback("__tmp__", 0, 0) if False else (lambda p,m: progress_cb(10 + p * 0.3, m) if progress_cb else None),
         progress_label="P.1 ดาวน์โหลด/สกัดเฟรม",
     )
     if progress_cb:
-        progress_cb(40, "กำลังดึงเฟรมของ P.67...")
+        progress_cb(40, "กำลังดึงภาพ P.67...")
     p67_results, p67_diag = extract_frames_for_tasks(
         p67_common,
         progress_cb=(lambda p,m: progress_cb(40 + p * 0.3, m) if progress_cb else None),
@@ -1506,7 +1510,7 @@ def build_combined_gif(hours: int, step: int, progress_cb=None):
     bytes67 = {slot: b for slot, b in p67_results}
 
     if progress_cb:
-        progress_cb(72, "กำลังอ่านประวัติระดับน้ำ...")
+        progress_cb(72, "กำลังอ่านระดับน้ำ...")
     h1, _ = fetch_water_history("P.1")
     h67, _ = fetch_water_history("P.67")
 
@@ -1553,7 +1557,7 @@ def build_combined_gif(hours: int, step: int, progress_cb=None):
             )
         )
         if progress_cb and idx % max(1, total_slots // 5) == 0:
-            progress_cb(75 + (idx / total_slots) * 15, f"กำลังประกอบภาพเปรียบเทียบ {idx}/{total_slots}")
+            progress_cb(75 + (idx / total_slots) * 15, f"กำลังประกอบภาพ {idx}/{total_slots}")
 
     if len(frames) < 2:
         raise RuntimeError(
@@ -1565,7 +1569,7 @@ def build_combined_gif(hours: int, step: int, progress_cb=None):
         )
 
     if progress_cb:
-        progress_cb(94, "กำลังเข้ารหัสไฟล์ GIF เปรียบเทียบ...")
+        progress_cb(94, "กำลังสร้าง GIF...")
     path = temp_path(".gif")
     frames[0].save(
         path,
@@ -1578,7 +1582,7 @@ def build_combined_gif(hours: int, step: int, progress_cb=None):
     )
 
     if progress_cb:
-        progress_cb(100, "สร้าง GIF เปรียบเทียบเสร็จแล้ว")
+        progress_cb(100, "เสร็จแล้ว")
     return path, len(frames), len(common_slots), {
         "P.1": p1_cam,
         "P.67": p67_cam,
@@ -1595,7 +1599,7 @@ HTML = """
 <head>
 <meta charset=\"utf-8\">
 <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">
-<title>Ping River Image Center v24</title>
+<title>Ping River Image Center v26</title>
 <style>
 :root{color-scheme:dark}
 *{box-sizing:border-box}
@@ -1622,7 +1626,7 @@ select{background:#0a1728;color:white;border:1px solid #36506c;padding:9px;borde
 </head>
 <body>
 <div class=\"wrap\">
-  <h1>🌊 Ping River Image Center v24</h1>
+  <h1>🌊 Ping River Image Center v26</h1>
   <div class=\"sub\">เวอร์ชันนี้ใช้ CCTV Playback แบบวิดีโอรายชั่วโมงเพื่อสร้าง GIF จากภาพจริงย้อนหลัง</div>
 
   <div class=\"grid\">
@@ -1680,9 +1684,8 @@ select{background:#0a1728;color:white;border:1px solid #36506c;padding:9px;borde
       <button class=\"alt\" onclick=\"makeCombined()\">GIF เปรียบเทียบ P.1 + P.67</button>
       <button class=\"alt\" onclick=\"checkHistory()\">ตรวจไฟล์ Playback</button>
     </div>
-    <div class=\"status\" id=\"workStatus\"></div>
     <div class=\"progress-wrap\"><div class=\"progress-bar\" id=\"workProgressBar\"></div></div>
-    <div class=\"muted\" id=\"workProgressText\">ยังไม่ได้เริ่มสร้าง GIF</div>
+    <div class=\"muted\" id=\"workProgressText\">พร้อมสร้าง GIF</div>
   </section>
 
   <div class=\"note\">
@@ -1696,10 +1699,8 @@ let currentJobPoll = null;
 function setWorkProgress(percent, message){
   const bar=document.getElementById('workProgressBar');
   const txt=document.getElementById('workProgressText');
-  const status=document.getElementById('workStatus');
   bar.style.width=`${Math.max(0, Math.min(100, percent||0))}%`;
   txt.textContent=message || '';
-  if(message) status.textContent = message;
 }
 
 async function loadStatus(station){
@@ -1762,7 +1763,7 @@ async function startJob(url){
     clearInterval(currentJobPoll);
     currentJobPoll=null;
   }
-  setWorkProgress(2, 'กำลังส่งคำสั่งสร้าง GIF...');
+  setWorkProgress(2, 'กำลังเริ่มงาน...');
   try{
     const r = await fetch(url);
     const j = await r.json();
@@ -1783,7 +1784,7 @@ function makeCombined(){
   startJob(`/api/job/start-gif-combined?hours=${h}&step=${s}`);
 }
 async function pollJob(jobId){
-  setWorkProgress(3, 'เริ่มประมวลผล...');
+  setWorkProgress(3, 'กำลังประมวลผล...');
   const poll = async () => {
     try{
       const r = await fetch(`/api/job-status?job_id=${encodeURIComponent(jobId)}`);
@@ -1811,7 +1812,7 @@ async function pollJob(jobId){
 }
 async function checkHistory(){
   const h=document.getElementById('hours').value;
-  const el=document.getElementById('workStatus');
+  const el=document.getElementById('workProgressText');
   el.textContent='กำลังตรวจ...';
   try{
     const [a,b]=await Promise.all([
@@ -2236,7 +2237,7 @@ def build_gif_range(station: str, start_dt: datetime, end_hour_dt: datetime, ste
         disposal=2,
     )
     if progress_cb:
-        progress_cb(100, "สร้าง GIF เสร็จแล้ว")
+        progress_cb(100, "เสร็จแล้ว")
     return path, len(frames), len(tasks), cam
 
 
