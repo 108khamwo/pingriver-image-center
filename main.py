@@ -64,7 +64,7 @@ def make_session():
     )
     s.mount("https://", HTTPAdapter(max_retries=retry))
     s.headers.update({
-        "User-Agent": "Mozilla/5.0 (PingRiverImageCenter/26.0)",
+        "User-Agent": "Mozilla/5.0 (PingRiverImageCenter/27.0)",
         "Accept": "*/*",
         "Referer": "https://appserv.net/pingriver.php",
     })
@@ -1117,42 +1117,45 @@ def render_report_frame(cctv_bytes: bytes, station: str, captured_at: datetime, 
         canvas.paste(image_panel, (img_left, img_top))
 
         if zoom_timestamp:
-            # ขยายบริเวณวันที่เวลา มุมซ้ายบน แล้ววาง popup ไว้ใต้ของจริงใกล้ ๆ กัน
-            crop_w = max(150, int(orig.width * 0.34))
-            crop_h = max(34, int(orig.height * 0.10))
+            # ขยายบริเวณวันที่เวลา มุมซ้ายบน โดยครอปให้แคบลงและขยายให้เต็มกรอบพอดี
+            crop_w = max(135, int(orig.width * 0.24))
+            crop_h = max(28, int(orig.height * 0.065))
             crop_w = min(crop_w, orig.width)
             crop_h = min(crop_h, orig.height)
             ts_crop = orig.crop((0, 0, crop_w, crop_h))
 
-            inset_w = int(image_box_w * 0.44)
-            inset_h = int(image_box_h * 0.16)
-            inset_x = img_left + int(size * 0.035)
-            inset_y = img_top + int(size * 0.055)
+            crop_ratio = crop_w / max(1, crop_h)
+            inset_h = int(image_box_h * 0.12)
+            inset_w = int(inset_h * crop_ratio)
+            inset_w = min(inset_w, int(image_box_w * 0.46))
+            inset_h = int(inset_w / crop_ratio)
+
+            inset_x = img_left + int(size * 0.028)
+            inset_y = img_top + int(size * 0.052)
 
             draw.rounded_rectangle(
-                (inset_x - 5, inset_y - 5, inset_x + inset_w + 5, inset_y + inset_h + 5),
-                radius=12,
+                (inset_x - 4, inset_y - 4, inset_x + inset_w + 4, inset_y + inset_h + 4),
+                radius=10,
                 fill=(8, 18, 32),
                 outline=(120, 180, 235),
                 width=2,
             )
 
-            # ใช้ contain + NEAREST เพื่อให้ตัวเลขใน overlay ใหญ่และคมขึ้น
-            inset_img = ImageOps.contain(
+            # ใช้ fit เพื่อให้ภาพซูมเต็มกรอบ ไม่มีพื้นที่ว่าง และตัวเลขชัดขึ้น
+            inset_img = ImageOps.fit(
                 ts_crop,
-                (inset_w - 10, inset_h - 10),
+                (max(1, inset_w - 8), max(1, inset_h - 8)),
                 method=Image.Resampling.NEAREST,
+                centering=(0.0, 0.0),
             )
             inset_panel = Image.new("RGB", (inset_w, inset_h), (5, 10, 18))
-            px = max(0, (inset_w - inset_img.width) // 2)
-            py = max(0, (inset_h - inset_img.height) // 2)
-            inset_panel.paste(inset_img, (px, py))
+            inset_panel.paste(inset_img, (4, 4))
             canvas.paste(inset_panel, (inset_x, inset_y))
 
-            # เส้นชี้สั้น ๆ จากต้นฉบับลงมาที่ popup
-            callout_start = (img_left + int(size * 0.085), img_top + int(size * 0.032))
-            callout_mid = (img_left + int(size * 0.095), img_top + int(size * 0.050))
-            callout_end = (inset_x + int(inset_w * 0.18), inset_y)
+            # เส้นชี้สั้น ๆ จาก timestamp เดิมลงมาหากรอบซูม
+            callout_start = (img_left + int(size * 0.078), img_top + int(size * 0.030))
+            callout_mid = (img_left + int(size * 0.086), img_top + int(size * 0.043))
+            callout_end = (inset_x + int(inset_w * 0.22), inset_y)
             draw.line([callout_start, callout_mid, callout_end], fill=(120, 180, 235), width=2)
     except Exception:
         draw.rectangle((img_left, img_top, img_right, img_bottom), fill=(40, 56, 74))
@@ -1599,7 +1602,7 @@ HTML = """
 <head>
 <meta charset=\"utf-8\">
 <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">
-<title>Ping River Image Center v26</title>
+<title>Ping River Image Center v27</title>
 <style>
 :root{color-scheme:dark}
 *{box-sizing:border-box}
@@ -1626,7 +1629,7 @@ select{background:#0a1728;color:white;border:1px solid #36506c;padding:9px;borde
 </head>
 <body>
 <div class=\"wrap\">
-  <h1>🌊 Ping River Image Center v26</h1>
+  <h1>🌊 Ping River Image Center v27</h1>
   <div class=\"sub\">เวอร์ชันนี้ใช้ CCTV Playback แบบวิดีโอรายชั่วโมงเพื่อสร้าง GIF จากภาพจริงย้อนหลัง</div>
 
   <div class=\"grid\">
