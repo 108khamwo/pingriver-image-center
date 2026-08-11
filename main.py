@@ -5,6 +5,8 @@ import json
 import math
 import tempfile
 import subprocess
+import threading
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote
@@ -41,6 +43,10 @@ GIF_DURATION_MS = 250
 
 app = FastAPI(title=APP_TITLE)
 
+JOBS = {}
+JOBS_LOCK = threading.Lock()
+JOB_TTL_SECONDS = 3600
+
 
 def now_bkk():
     return datetime.now(BKK)
@@ -58,7 +64,7 @@ def make_session():
     )
     s.mount("https://", HTTPAdapter(max_retries=retry))
     s.headers.update({
-        "User-Agent": "Mozilla/5.0 (PingRiverImageCenter/10.0)",
+        "User-Agent": "Mozilla/5.0 (PingRiverImageCenter/13.0)",
         "Accept": "*/*",
         "Referer": "https://appserv.net/pingriver.php",
     })
@@ -66,6 +72,81 @@ def make_session():
 
 
 HTTP = make_session()
+
+
+
+def purge_old_jobs():
+    cutoff = now_bkk() - timedelta(seconds=JOB_TTL_SECONDS)
+    remove_ids = []
+    with JOBS_LOCK:
+        for job_id, job in JOBS.items():
+            updated = job.get("updated_at") or job.get("created_at") or now_bkk()
+            if updated < cutoff:
+                remove_ids.append(job_id)
+        for job_id in remove_ids:
+            path = JOBS[job_id].get("path")
+            if path:
+                remove_file(path)
+            JOBS.pop(job_id, None)
+
+
+def create_job(job_type: str, payload: dict):
+    purge_old_jobs()
+    job_id = uuid.uuid4().hex
+    now = now_bkk()
+    with JOBS_LOCK:
+        JOBS[job_id] = {
+            "job_id": job_id,
+            "job_type": job_type,
+            "payload": payload,
+            "status": "queued",
+            "progress": 0,
+            "message": "รอเริ่มงาน...",
+            "created_at": now,
+            "updated_at": now,
+            "path": None,
+            "filename": None,
+            "error": None,
+        }
+    return job_id
+
+
+def update_job(job_id: str, **kwargs):
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if not job:
+            return
+        job.update(kwargs)
+        job["updated_at"] = now_bkk()
+
+
+def get_job(job_id: str):
+    purge_old_jobs()
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if not job:
+            return None
+        out = dict(job)
+        for k in ("created_at", "updated_at"):
+            if isinstance(out.get(k), datetime):
+                out[k] = out[k].isoformat()
+        return out
+
+
+def job_progress_callback(job_id: str, start_pct=0, end_pct=100):
+    def cb(progress_value, message):
+        try:
+            progress_value = max(0.0, min(100.0, float(progress_value)))
+        except Exception:
+            progress_value = 0.0
+        mapped = start_pct + ((end_pct - start_pct) * (progress_value / 100.0))
+        update_job(
+            job_id,
+            status="running",
+            progress=int(mapped),
+            message=message,
+        )
+    return cb
 
 
 def validate_station(station: str) -> str:
@@ -642,7 +723,7 @@ def wallclock_offset_to_video_seconds(offset_seconds: int, duration: float):
     return max(0.0, target)
 
 
-def extract_frames_for_tasks(tasks):
+def extract_frames_for_tasks(tasks, progress_cb=None, progress_start=0, progress_end=100, progress_label='กำลังดึงเฟรม'):
     """
     ดาวน์โหลด MP4 ต่อชั่วโมงเพียงครั้งเดียว
     แล้วสกัดหลายเฟรมจากไฟล์ local ตามสัดส่วนเวลา
@@ -668,12 +749,17 @@ def extract_frames_for_tasks(tasks):
 
     results = []
     diagnostics = []
-
-    # ทำทีละไฟล์เพื่อไม่ให้ Render Free ใช้ disk/network หนักเกิน
-    for (_, _), group in sorted(
+    ordered_groups = sorted(
         groups.items(),
         key=lambda kv: min(t["slot"] for t in kv[1]["tasks"])
-    ):
+    )
+    total_groups = max(1, len(ordered_groups))
+
+    # ทำทีละไฟล์เพื่อไม่ให้ Render Free ใช้ disk/network หนักเกิน
+    for idx, ((_, _), group) in enumerate(ordered_groups, start=1):
+        if progress_cb:
+            group_pct = ((idx - 1) / total_groups) * 100.0
+            progress_cb(group_pct, f"{progress_label} {idx}/{total_groups}: {group['rel_file']}")
         video_path = None
         try:
             video_path = download_playback_video(
@@ -712,6 +798,9 @@ def extract_frames_for_tasks(tasks):
                 "requested_frames": len(group["tasks"]),
                 "ok_frames": ok_count,
             })
+            if progress_cb:
+                group_pct = (idx / total_groups) * 100.0
+                progress_cb(group_pct, f"{progress_label} {idx}/{total_groups}: เสร็จ {group['rel_file']}")
 
         except Exception as e:
             diagnostics.append({
@@ -837,23 +926,43 @@ def nearest_water_level(history, dt):
 
 
 def render_report_frame(cctv_bytes: bytes, station: str, captured_at: datetime, water_level, size: int):
-    canvas = Image.new("RGB", (size, size), (12, 26, 44))
+    # ปรับโทนโดยรวมให้เป็นสีฟ้ามากขึ้น
+    canvas = Image.new("RGB", (size, size), (10, 32, 60))
     draw = ImageDraw.Draw(canvas)
 
-    title_font = get_font(max(28, int(size * 0.046)), True)
-    label_font = get_font(max(22, int(size * 0.034)), True)
-    value_font = get_font(max(28, int(size * 0.050)), True)
-    small_font = get_font(max(17, int(size * 0.026)), False)
+    margin = int(size * 0.032)
+    header_h = int(size * 0.145)   # ส่วนหัวใหญ่ขึ้น
+    footer_h = int(size * 0.24)
 
-    margin = int(size * 0.035)
-    header_h = int(size * 0.12)
-    footer_h = int(size * 0.23)
+    title_text = f"{station}  {STATIONS[station]}"
+    title_font = fit_font_to_width(
+        draw,
+        title_text,
+        max_width=size - (margin * 4),
+        start_size=max(34, int(size * 0.060)),
+        bold=True,
+        min_size=24,
+    )
+    label_font = get_font(max(21, int(size * 0.032)), True)
+    value_font = get_font(max(31, int(size * 0.054)), True)
+    medium_font = get_font(max(18, int(size * 0.028)), False)
+    small_font = get_font(max(16, int(size * 0.024)), False)
 
-    draw.rounded_rectangle((margin, margin, size - margin, margin + header_h),
-                           radius=int(size * 0.02), fill=(25, 59, 101))
-    draw.text((int(margin * 1.5), margin + int(header_h * 0.17)),
-              f"{station}  {STATIONS[station]}", font=title_font, fill="white")
+    # Header
+    draw.rounded_rectangle(
+        (margin, margin, size - margin, margin + header_h),
+        radius=int(size * 0.022),
+        fill=(29, 79, 135),
+    )
+    title_w, title_h = text_size(draw, title_text, title_font)
+    draw.text(
+        (int(margin * 1.45), margin + (header_h - title_h) // 2 - 2),
+        title_text,
+        font=title_font,
+        fill="white",
+    )
 
+    # Image area
     img_top = margin + header_h + int(size * 0.02)
     img_bottom = size - margin - footer_h - int(size * 0.02)
     img_left = margin
@@ -861,31 +970,132 @@ def render_report_frame(cctv_bytes: bytes, station: str, captured_at: datetime, 
 
     try:
         im = Image.open(io.BytesIO(cctv_bytes)).convert("RGB")
-        im = ImageOps.fit(im, (img_right - img_left, img_bottom - img_top),
-                          method=Image.Resampling.LANCZOS, centering=(0.5, 0.5))
+        im = ImageOps.fit(
+            im,
+            (img_right - img_left, img_bottom - img_top),
+            method=Image.Resampling.LANCZOS,
+            centering=(0.5, 0.5),
+        )
         canvas.paste(im, (img_left, img_top))
     except Exception:
-        draw.rectangle((img_left, img_top, img_right, img_bottom), fill=(30, 38, 49))
+        draw.rectangle((img_left, img_top, img_right, img_bottom), fill=(40, 56, 74))
         draw.text((img_left + 20, img_top + 20), "โหลดภาพ CCTV ไม่สำเร็จ", font=label_font, fill="white")
 
+    # Footer panel
     y1 = size - margin - footer_h
     y2 = size - margin
-    draw.rounded_rectangle((margin, y1, size - margin, y2),
-                           radius=int(size * 0.02), fill=(20, 43, 72))
+    draw.rounded_rectangle(
+        (margin, y1, size - margin, y2),
+        radius=int(size * 0.022),
+        fill=(21, 54, 95),
+    )
+
+    inner_pad_x = int(size * 0.020)
+    inner_pad_y = int(size * 0.022)
+    left_x = margin + inner_pad_x
+    right_x = int(size * 0.54)
+    top_y = y1 + inner_pad_y
+    content_h = footer_h - (inner_pad_y * 2)
+
+    # Separator
+    sep_x = int(size * 0.505)
+    draw.line(
+        (sep_x, y1 + inner_pad_y, sep_x, y2 - inner_pad_y),
+        fill=(52, 94, 144),
+        width=2,
+    )
 
     level_text = "-" if water_level is None else f"{water_level:.2f} เมตร"
-    draw.text((int(margin * 1.5), y1 + int(footer_h * 0.14)), "ระดับน้ำ", font=label_font, fill=(184, 211, 245))
-    draw.text((int(margin * 1.5), y1 + int(footer_h * 0.39)), level_text, font=value_font, fill="white")
+    current_dt_text = captured_at.astimezone(BKK).strftime("%d/%m/%Y %H:%M")
+    period_start = captured_at.astimezone(BKK).replace(minute=0, second=0, microsecond=0)
+    period_end = period_start + timedelta(hours=1)
+    period_text = f"ช่วง {period_start.strftime('%d/%m/%Y %H:%M')} - {period_end.strftime('%H:%M')} น."
 
-    time_text = captured_at.astimezone(BKK).strftime("%d/%m/%Y  %H:%M")
-    x_time = int(size * 0.53)
-    draw.text((x_time, y1 + int(footer_h * 0.14)), "เวลา CCTV", font=label_font, fill=(184, 211, 245))
-    draw.text((x_time, y1 + int(footer_h * 0.43)), time_text, font=small_font, fill="white")
-    draw.text((x_time, y1 + int(footer_h * 0.68)),
-              "ข้อมูล AppServ / ระบบโทรมาตร กรมชลประทาน",
-              font=small_font, fill=(210, 220, 230))
+    # LEFT BLOCK: current water level + current date/time
+    left_w = sep_x - left_x - inner_pad_x
+    draw.text(
+        (left_x, top_y + int(content_h * 0.02)),
+        "ระดับน้ำปัจจุบัน",
+        font=label_font,
+        fill=(190, 220, 252),
+    )
+    draw.text(
+        (left_x, top_y + int(content_h * 0.30)),
+        level_text,
+        font=value_font,
+        fill="white",
+    )
+
+    left_time_font = fit_font_to_width(
+        draw,
+        current_dt_text,
+        max_width=left_w,
+        start_size=max(17, int(size * 0.028)),
+        bold=False,
+        min_size=13,
+    )
+    draw.text(
+        (left_x, top_y + int(content_h * 0.70)),
+        current_dt_text,
+        font=left_time_font,
+        fill=(216, 228, 240),
+    )
+
+    # RIGHT BLOCK: date/time period only, no "เวลา CCTV"
+    right_w = size - margin - right_x - inner_pad_x
+    right_title = "ช่วงเวลา"
+    draw.text(
+        (right_x, top_y + int(content_h * 0.02)),
+        right_title,
+        font=label_font,
+        fill=(190, 220, 252),
+    )
+
+    period_font = fit_font_to_width(
+        draw,
+        period_text,
+        max_width=right_w,
+        start_size=max(18, int(size * 0.028)),
+        bold=False,
+        min_size=13,
+    )
+    period_lines = wrap_text_to_width(
+        draw,
+        period_text,
+        period_font,
+        max_width=right_w,
+        max_lines=2,
+    )
+    line_h = text_size(draw, "Ag", period_font)[1] + 5
+    start_line_y = top_y + int(content_h * 0.35)
+    for i, line in enumerate(period_lines):
+        draw.text(
+            (right_x, start_line_y + (i * line_h)),
+            line,
+            font=period_font,
+            fill="white" if i == 0 else (216, 228, 240),
+        )
+
+    source_text = "ข้อมูล AppServ / ระบบโทรมาตร กรมชลประทาน"
+    source_font = fit_font_to_width(
+        draw,
+        source_text,
+        max_width=right_w,
+        start_size=max(14, int(size * 0.022)),
+        bold=False,
+        min_size=11,
+    )
+    source_lines = wrap_text_to_width(draw, source_text, source_font, max_width=right_w, max_lines=2)
+    source_y = y2 - inner_pad_y - (len(source_lines) * (text_size(draw, "Ag", source_font)[1] + 2))
+    for i, line in enumerate(source_lines):
+        draw.text(
+            (right_x, source_y + i * (text_size(draw, "Ag", source_font)[1] + 2)),
+            line,
+            font=source_font,
+            fill=(193, 210, 229),
+        )
+
     return canvas
-
 
 def latest_png(station: str):
     url, _ = latest_cache_jpg(station)
@@ -1004,27 +1214,46 @@ def extract_task_frame(task):
     return task["slot"], b
 
 
-def build_gif(station: str, hours: int, step: int):
+def build_gif(station: str, hours: int, step: int, progress_cb=None):
+    if progress_cb:
+        progress_cb(3, f"กำลังเตรียมรายการภาพย้อนหลัง {station}...")
     tasks, cam = build_slot_tasks(station, hours, step)
     if len(tasks) < 2:
         raise RuntimeError("จำนวนช่วงเวลาที่สร้างได้ไม่พอสำหรับทำ GIF")
 
+    if progress_cb:
+        progress_cb(10, "กำลังอ่านประวัติระดับน้ำ...")
     history, _ = fetch_water_history(station)
 
-    results, diagnostics = extract_frames_for_tasks(tasks)
+    if progress_cb:
+        progress_cb(15, "กำลังดาวน์โหลดวิดีโอและสกัดเฟรม...")
+    results, diagnostics = extract_frames_for_tasks(
+        tasks,
+        progress_cb=progress_cb,
+        progress_start=15,
+        progress_end=75,
+        progress_label=f"{station} ดาวน์โหลด/สกัดเฟรม",
+    )
     if len(results) < 2:
         raise RuntimeError(
             "ดึงเฟรมจากวิดีโอได้ไม่พอสำหรับทำ GIF | "
             + json.dumps(diagnostics[-8:], ensure_ascii=False, default=str)
         )
 
+    if progress_cb:
+        progress_cb(80, "กำลังจัดวางภาพรายงาน...")
     frames = []
-    for slot, b in results:
+    total_results = max(1, len(results))
+    for idx, (slot, b) in enumerate(results, start=1):
         level = nearest_water_level(history, slot)
         fr = render_report_frame(b, station, slot, level, GIF_SIZE)
         fr = fr.quantize(colors=128, method=Image.Quantize.MEDIANCUT)
         frames.append(fr)
+        if progress_cb and idx % max(1, total_results // 5) == 0:
+            progress_cb(80 + (idx / total_results) * 10, f"กำลังจัดวางภาพ {idx}/{total_results}")
 
+    if progress_cb:
+        progress_cb(92, "กำลังเข้ารหัสไฟล์ GIF...")
     path = temp_path(".gif")
     frames[0].save(
         path,
@@ -1035,12 +1264,16 @@ def build_gif(station: str, hours: int, step: int):
         optimize=False,
         disposal=2,
     )
+    if progress_cb:
+        progress_cb(100, "สร้าง GIF เสร็จแล้ว")
     return path, len(frames), len(tasks), {
         **cam,
         "frame_diagnostics": diagnostics[-20:],
     }
 
-def build_combined_gif(hours: int, step: int):
+def build_combined_gif(hours: int, step: int, progress_cb=None):
+    if progress_cb:
+        progress_cb(3, "กำลังเตรียมรายการภาพย้อนหลังสำหรับ P.1 และ P.67...")
     p1_tasks, p1_cam = build_slot_tasks("P.1", hours, step)
     p67_tasks, p67_cam = build_slot_tasks("P.67", hours, step)
 
@@ -1053,21 +1286,35 @@ def build_combined_gif(hours: int, step: int):
             "ช่วงเวลาที่ P.1 และ P.67 ซ้อนกันมีไม่พอสำหรับ GIF เปรียบเทียบ"
         )
 
-    # เอาเฉพาะ task ที่อยู่ใน common slots
     p1_common = [map1[s] for s in common_slots]
     p67_common = [map67[s] for s in common_slots]
 
-    p1_results, p1_diag = extract_frames_for_tasks(p1_common)
-    p67_results, p67_diag = extract_frames_for_tasks(p67_common)
+    if progress_cb:
+        progress_cb(10, "กำลังดึงเฟรมของ P.1...")
+    p1_results, p1_diag = extract_frames_for_tasks(
+        p1_common,
+        progress_cb=job_progress_callback("__tmp__", 0, 0) if False else (lambda p,m: progress_cb(10 + p * 0.3, m) if progress_cb else None),
+        progress_label="P.1 ดาวน์โหลด/สกัดเฟรม",
+    )
+    if progress_cb:
+        progress_cb(40, "กำลังดึงเฟรมของ P.67...")
+    p67_results, p67_diag = extract_frames_for_tasks(
+        p67_common,
+        progress_cb=(lambda p,m: progress_cb(40 + p * 0.3, m) if progress_cb else None),
+        progress_label="P.67 ดาวน์โหลด/สกัดเฟรม",
+    )
 
     bytes1 = {slot: b for slot, b in p1_results}
     bytes67 = {slot: b for slot, b in p67_results}
 
+    if progress_cb:
+        progress_cb(72, "กำลังอ่านประวัติระดับน้ำ...")
     h1, _ = fetch_water_history("P.1")
     h67, _ = fetch_water_history("P.67")
 
     frames = []
-    for slot in common_slots:
+    total_slots = max(1, len(common_slots))
+    for idx, slot in enumerate(common_slots, start=1):
         if slot not in bytes1 or slot not in bytes67:
             continue
 
@@ -1099,6 +1346,8 @@ def build_combined_gif(hours: int, step: int):
                 method=Image.Quantize.MEDIANCUT,
             )
         )
+        if progress_cb and idx % max(1, total_slots // 5) == 0:
+            progress_cb(75 + (idx / total_slots) * 15, f"กำลังประกอบภาพเปรียบเทียบ {idx}/{total_slots}")
 
     if len(frames) < 2:
         raise RuntimeError(
@@ -1109,6 +1358,8 @@ def build_combined_gif(hours: int, step: int):
             }, ensure_ascii=False, default=str)
         )
 
+    if progress_cb:
+        progress_cb(94, "กำลังเข้ารหัสไฟล์ GIF เปรียบเทียบ...")
     path = temp_path(".gif")
     frames[0].save(
         path,
@@ -1120,6 +1371,8 @@ def build_combined_gif(hours: int, step: int):
         disposal=2,
     )
 
+    if progress_cb:
+        progress_cb(100, "สร้าง GIF เปรียบเทียบเสร็จแล้ว")
     return path, len(frames), len(common_slots), {
         "P.1": p1_cam,
         "P.67": p67_cam,
@@ -1130,14 +1383,13 @@ def build_combined_gif(hours: int, step: int):
     }
 
 
-
 HTML = """
 <!doctype html>
 <html lang=\"th\">
 <head>
 <meta charset=\"utf-8\">
 <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">
-<title>Ping River Image Center v10</title>
+<title>Ping River Image Center v13</title>
 <style>
 :root{color-scheme:dark}
 *{box-sizing:border-box}
@@ -1157,11 +1409,14 @@ select{background:#0a1728;color:white;border:1px solid #36506c;padding:9px;borde
 .big{font-size:28px;font-weight:800;margin:9px 0}
 .tools{margin-top:18px}
 .note{margin-top:20px;padding:14px;border-radius:12px;background:#102a44;color:#bcd0e5}
+.progress-wrap{margin-top:10px;background:#0a1728;border:1px solid #284664;border-radius:999px;overflow:hidden;height:14px}
+.progress-bar{height:100%;width:0%;background:#2f86ff;transition:width .25s ease}
+.muted{color:#8ea6c5;font-size:13px;margin-top:8px}
 </style>
 </head>
 <body>
 <div class=\"wrap\">
-  <h1>🌊 Ping River Image Center v10</h1>
+  <h1>🌊 Ping River Image Center v13</h1>
   <div class=\"sub\">เวอร์ชันนี้ใช้ CCTV Playback แบบวิดีโอรายชั่วโมงเพื่อสร้าง GIF จากภาพจริงย้อนหลัง</div>
 
   <div class=\"grid\">
@@ -1218,6 +1473,8 @@ select{background:#0a1728;color:white;border:1px solid #36506c;padding:9px;borde
       <button class=\"alt\" onclick=\"checkHistory()\">ตรวจไฟล์ Playback</button>
     </div>
     <div class=\"status\" id=\"workStatus\"></div>
+    <div class=\"progress-wrap\"><div class=\"progress-bar\" id=\"workProgressBar\"></div></div>
+    <div class=\"muted\" id=\"workProgressText\">ยังไม่ได้เริ่มสร้าง GIF</div>
   </section>
 
   <div class=\"note\">
@@ -1226,6 +1483,17 @@ select{background:#0a1728;color:white;border:1px solid #36506c;padding:9px;borde
 </div>
 <script>
 const id = s => s.replace('.','');
+let currentJobPoll = null;
+
+function setWorkProgress(percent, message){
+  const bar=document.getElementById('workProgressBar');
+  const txt=document.getElementById('workProgressText');
+  const status=document.getElementById('workStatus');
+  bar.style.width=`${Math.max(0, Math.min(100, percent||0))}%`;
+  txt.textContent=message || '';
+  if(message) status.textContent = message;
+}
+
 async function loadStatus(station){
   const el=document.getElementById('status-'+id(station));
   const lv=document.getElementById('level-'+id(station));
@@ -1246,17 +1514,57 @@ function refreshCamera(station){
   img.src='/camera/latest?station='+encodeURIComponent(station)+'&t='+Date.now();
   loadStatus(station);
 }
+async function startJob(url){
+  if(currentJobPoll){
+    clearInterval(currentJobPoll);
+    currentJobPoll=null;
+  }
+  setWorkProgress(2, 'กำลังส่งคำสั่งสร้าง GIF...');
+  try{
+    const r = await fetch(url);
+    const j = await r.json();
+    if(!r.ok) throw new Error(j.detail || 'start job failed');
+    pollJob(j.job_id);
+  }catch(e){
+    setWorkProgress(0, 'เริ่มงานไม่สำเร็จ: ' + e.message);
+  }
+}
 function makeGif(station){
   const h=document.getElementById('hours').value;
   const s=document.getElementById('step').value;
-  document.getElementById('workStatus').textContent='กำลังสร้าง GIF จาก Playback... อาจใช้เวลาสักครู่';
-  location.href=`/download/gif?station=${encodeURIComponent(station)}&hours=${h}&step=${s}`;
+  startJob(`/api/job/start-gif?station=${encodeURIComponent(station)}&hours=${h}&step=${s}`);
 }
 function makeCombined(){
   const h=document.getElementById('hours').value;
   const s=document.getElementById('step').value;
-  document.getElementById('workStatus').textContent='กำลังสร้าง GIF เปรียบเทียบ...';
-  location.href=`/download/gif-combined?hours=${h}&step=${s}`;
+  startJob(`/api/job/start-gif-combined?hours=${h}&step=${s}`);
+}
+async function pollJob(jobId){
+  setWorkProgress(3, 'เริ่มประมวลผล...');
+  const poll = async () => {
+    try{
+      const r = await fetch(`/api/job-status?job_id=${encodeURIComponent(jobId)}`);
+      const j = await r.json();
+      if(!r.ok) throw new Error(j.detail || 'status failed');
+
+      setWorkProgress(j.progress || 0, j.message || 'กำลังทำงาน...');
+
+      if(j.status === 'done'){
+        clearInterval(currentJobPoll);
+        currentJobPoll = null;
+        setWorkProgress(100, 'เสร็จแล้ว กำลังดาวน์โหลดไฟล์...');
+        window.location.href = `/api/job-download?job_id=${encodeURIComponent(jobId)}`;
+      }else if(j.status === 'error'){
+        clearInterval(currentJobPoll);
+        currentJobPoll = null;
+        setWorkProgress(j.progress || 0, 'เกิดข้อผิดพลาด: ' + (j.error || 'ไม่ทราบสาเหตุ'));
+      }
+    }catch(e){
+      setWorkProgress(0, 'ตรวจสถานะไม่สำเร็จ: ' + e.message);
+    }
+  };
+  await poll();
+  currentJobPoll = setInterval(poll, 1500);
 }
 async function checkHistory(){
   const h=document.getElementById('hours').value;
@@ -1573,6 +1881,124 @@ def download_png(station: str = Query(...)):
                             background=BackgroundTask(remove_file, path))
     except Exception as e:
         raise HTTPException(502, f"สร้าง PNG ไม่สำเร็จ: {e}")
+
+
+
+def _run_gif_job(job_id: str, station: str, hours: int, step: int):
+    try:
+        cb = job_progress_callback(job_id)
+        update_job(job_id, status="running", progress=1, message="เริ่มงานสร้าง GIF...")
+        path, frames, tasks, cam = build_gif(station, hours, step, progress_cb=cb)
+        filename = f"{station.replace('.','')}_{hours}h_step{step}m_{frames}frames.gif"
+        update_job(
+            job_id,
+            status="done",
+            progress=100,
+            message=f"สร้างเสร็จแล้ว {frames} เฟรม พร้อมดาวน์โหลด",
+            path=path,
+            filename=filename,
+            meta={"frames": frames, "tasks": tasks, "cam": cam},
+        )
+    except Exception as e:
+        update_job(
+            job_id,
+            status="error",
+            message="สร้าง GIF ไม่สำเร็จ",
+            error=str(e),
+        )
+
+
+def _run_combined_gif_job(job_id: str, hours: int, step: int):
+    try:
+        cb = job_progress_callback(job_id)
+        update_job(job_id, status="running", progress=1, message="เริ่มงานสร้าง GIF เปรียบเทียบ...")
+        path, frames, slots, meta = build_combined_gif(hours, step, progress_cb=cb)
+        filename = f"P1_P67_compare_{hours}h_step{step}m_{frames}frames.gif"
+        update_job(
+            job_id,
+            status="done",
+            progress=100,
+            message=f"สร้างเสร็จแล้ว {frames} เฟรม พร้อมดาวน์โหลด",
+            path=path,
+            filename=filename,
+            meta={"frames": frames, "slots": slots, "meta": meta},
+        )
+    except Exception as e:
+        update_job(
+            job_id,
+            status="error",
+            message="สร้าง GIF เปรียบเทียบไม่สำเร็จ",
+            error=str(e),
+        )
+
+
+@app.get("/api/job/start-gif")
+def api_job_start_gif(
+    station: str = Query(...),
+    hours: int = Query(24, ge=1, le=72),
+    step: int = Query(15),
+):
+    station = validate_station(station)
+    if step not in (5, 10, 15, 30):
+        raise HTTPException(400, "step ต้องเป็น 5, 10, 15 หรือ 30 นาที")
+    estimated = math.ceil(hours * 60 / step)
+    if estimated > 240:
+        raise HTTPException(400, "จำนวนเฟรมมากเกินไปสำหรับ Render Free กรุณาเพิ่ม step หรือลดชั่วโมง")
+    job_id = create_job("gif", {"station": station, "hours": hours, "step": step})
+    t = threading.Thread(target=_run_gif_job, args=(job_id, station, hours, step), daemon=True)
+    t.start()
+    return {"ok": True, "job_id": job_id}
+
+
+@app.get("/api/job/start-gif-combined")
+def api_job_start_gif_combined(
+    hours: int = Query(24, ge=1, le=72),
+    step: int = Query(15),
+):
+    if step not in (5, 10, 15, 30):
+        raise HTTPException(400, "step ต้องเป็น 5, 10, 15 หรือ 30 นาที")
+    estimated = math.ceil(hours * 60 / step)
+    if estimated > 120:
+        raise HTTPException(400, "GIF เปรียบเทียบใช้ทรัพยากรมาก กรุณาเลือก step มากขึ้นหรือลดชั่วโมง")
+    job_id = create_job("gif-combined", {"hours": hours, "step": step})
+    t = threading.Thread(target=_run_combined_gif_job, args=(job_id, hours, step), daemon=True)
+    t.start()
+    return {"ok": True, "job_id": job_id}
+
+
+@app.get("/api/job-status")
+def api_job_status(job_id: str = Query(...)):
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(404, "ไม่พบ job นี้")
+    return job
+
+
+@app.get("/api/job-download")
+def api_job_download(job_id: str = Query(...)):
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if not job:
+            raise HTTPException(404, "ไม่พบ job นี้")
+        if job.get("status") != "done" or not job.get("path"):
+            raise HTTPException(400, "งานยังไม่เสร็จหรือไม่มีไฟล์ผลลัพธ์")
+        path = job["path"]
+        filename = job.get("filename") or "result.gif"
+
+    def cleanup():
+        remove_file(path)
+        with JOBS_LOCK:
+            if job_id in JOBS:
+                JOBS[job_id]["path"] = None
+                JOBS[job_id]["status"] = "downloaded"
+                JOBS[job_id]["updated_at"] = now_bkk()
+
+    return FileResponse(
+        path,
+        media_type="image/gif",
+        filename=filename,
+        background=BackgroundTask(cleanup),
+    )
 
 
 @app.get("/download/gif")
