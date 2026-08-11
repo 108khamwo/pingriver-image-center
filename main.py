@@ -58,7 +58,7 @@ def make_session():
     )
     s.mount("https://", HTTPAdapter(max_retries=retry))
     s.headers.update({
-        "User-Agent": "Mozilla/5.0 (PingRiverImageCenter/9.0)",
+        "User-Agent": "Mozilla/5.0 (PingRiverImageCenter/10.0)",
         "Accept": "*/*",
         "Referer": "https://appserv.net/pingriver.php",
     })
@@ -90,7 +90,12 @@ def fetch_bytes(url: str) -> bytes:
 
 
 def get_font(size, bold=False):
+    """
+    ใช้ฟอนต์ Prompt เป็นหลัก เพื่อให้ข้อความไทยใน PNG/GIF แสดงถูกต้อง
+    """
     candidates = [
+        "/usr/share/fonts/truetype/prompt/Prompt-Bold.ttf" if bold else "/usr/share/fonts/truetype/prompt/Prompt-Regular.ttf",
+        "/usr/local/share/fonts/Prompt-Bold.ttf" if bold else "/usr/local/share/fonts/Prompt-Regular.ttf",
         "/usr/share/fonts/truetype/noto/NotoSansThai-Bold.ttf" if bold else "/usr/share/fonts/truetype/noto/NotoSansThai-Regular.ttf",
         "/usr/share/fonts/opentype/noto/NotoSansThai-Bold.ttf" if bold else "/usr/share/fonts/opentype/noto/NotoSansThai-Regular.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
@@ -99,6 +104,7 @@ def get_font(size, bold=False):
         if os.path.exists(p):
             return ImageFont.truetype(p, size=size)
     return ImageFont.load_default()
+
 
 
 def temp_path(suffix: str):
@@ -876,7 +882,7 @@ def render_report_frame(cctv_bytes: bytes, station: str, captured_at: datetime, 
     draw.text((x_time, y1 + int(footer_h * 0.14)), "เวลา CCTV", font=label_font, fill=(184, 211, 245))
     draw.text((x_time, y1 + int(footer_h * 0.43)), time_text, font=small_font, fill="white")
     draw.text((x_time, y1 + int(footer_h * 0.68)),
-              "ข้อมูล: AppServ / ระบบโทรมาตร กรมชลประทาน",
+              "ข้อมูล AppServ / ระบบโทรมาตร กรมชลประทาน",
               font=small_font, fill=(210, 220, 230))
     return canvas
 
@@ -1131,7 +1137,7 @@ HTML = """
 <head>
 <meta charset=\"utf-8\">
 <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">
-<title>Ping River Image Center v9</title>
+<title>Ping River Image Center v10</title>
 <style>
 :root{color-scheme:dark}
 *{box-sizing:border-box}
@@ -1155,7 +1161,7 @@ select{background:#0a1728;color:white;border:1px solid #36506c;padding:9px;borde
 </head>
 <body>
 <div class=\"wrap\">
-  <h1>🌊 Ping River Image Center v9</h1>
+  <h1>🌊 Ping River Image Center v10</h1>
   <div class=\"sub\">เวอร์ชันนี้ใช้ CCTV Playback แบบวิดีโอรายชั่วโมงเพื่อสร้าง GIF จากภาพจริงย้อนหลัง</div>
 
   <div class=\"grid\">
