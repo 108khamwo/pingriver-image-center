@@ -1,4 +1,4 @@
-# Ping River Image Center v4
+# Ping River Image Center v5
 
 เวอร์ชันนี้อัปเดตให้ใช้ CCTV Playback แบบวิดีโอรายชั่วโมง (`hourly/*.mp4`) เพื่อสร้าง GIF จากภาพจริงย้อนหลัง
 
@@ -41,3 +41,13 @@
 - ประกอบ `/cache/P.x/YYYY/MM/<filename>` อัตโนมัติ
 - ตรวจ 3 source: `op=camlist`, หน้า station และ `ajax_data_only`
 - เพิ่ม `/api/debug/latest-sources?station=P.67`
+
+
+## แก้ไข v5
+- เพิ่มรองรับ signed Playback URL ผ่าน Render Environment Variables
+- ใช้ได้ทั้งแบบ:
+  - `PLAYBACK_P1_URL_SAMPLE`
+  - `PLAYBACK_P67_URL_SAMPLE`
+  - หรือ `PLAYBACK_P1_EXP` / `PLAYBACK_P1_SIG`, `PLAYBACK_P67_EXP` / `PLAYBACK_P67_SIG`
+- เพิ่ม `/api/debug/playback-auth?station=P.67`
+- ถ้า AppServ ไม่ส่ง `exp/sig` มาเอง ระบบจะ fallback ไปใช้ค่าจาก env

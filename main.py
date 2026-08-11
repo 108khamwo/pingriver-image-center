@@ -58,7 +58,7 @@ def make_session():
     )
     s.mount("https://", HTTPAdapter(max_retries=retry))
     s.headers.update({
-        "User-Agent": "Mozilla/5.0 (PingRiverImageCenter/4.0)",
+        "User-Agent": "Mozilla/5.0 (PingRiverImageCenter/5.0)",
         "Accept": "*/*",
         "Referer": "https://appserv.net/pingriver.php",
     })
@@ -113,6 +113,45 @@ def remove_file(path: str):
         os.unlink(path)
     except OSError:
         pass
+
+
+
+def extract_exp_sig_from_url(url: str):
+    m_exp = re.search(r"[?&]exp=(\d+)", url)
+    m_sig = re.search(r"[?&]sig=([a-fA-F0-9]+)", url)
+    exp = m_exp.group(1) if m_exp else None
+    sig = m_sig.group(1) if m_sig else None
+    return exp, sig
+
+
+def playback_auth_from_env(station: str):
+    """
+    รองรับ 3 รูปแบบ:
+    1) PLAYBACK_<station>_URL_SAMPLE = full signed playback url
+       เช่น PLAYBACK_P67_URL_SAMPLE
+    2) PLAYBACK_<station>_EXP / PLAYBACK_<station>_SIG
+    3) PLAYBACK_EXP / PLAYBACK_SIG (ใช้ร่วมทุก station)
+    หมายเหตุ station P.67 -> key ใช้ P67, P.1 -> P1
+    """
+    key = station.replace(".", "").upper()
+
+    sample = os.getenv(f"PLAYBACK_{key}_URL_SAMPLE", "").strip()
+    if sample:
+        exp, sig = extract_exp_sig_from_url(sample)
+        if exp and sig:
+            return exp, sig, f"env:PLAYBACK_{key}_URL_SAMPLE"
+
+    exp = os.getenv(f"PLAYBACK_{key}_EXP", "").strip()
+    sig = os.getenv(f"PLAYBACK_{key}_SIG", "").strip()
+    if exp and sig:
+        return exp, sig, f"env:PLAYBACK_{key}_EXP/SIG"
+
+    exp = os.getenv("PLAYBACK_EXP", "").strip()
+    sig = os.getenv("PLAYBACK_SIG", "").strip()
+    if exp and sig:
+        return exp, sig, "env:PLAYBACK_EXP/SIG"
+
+    return None, None, None
 
 
 def camera_timestamp_from_cache_url(value: str):
@@ -535,10 +574,25 @@ def build_slot_tasks(station: str, hours: int, step: int):
     cam = fetch_camlist(station)
     exp = cam.get("exp")
     sig = cam.get("sig")
+    auth_source = "camlist"
+
     if not (exp and sig):
         discovered_exp, discovered_sig = try_discover_sig_from_page(station)
-        exp = exp or discovered_exp
-        sig = sig or discovered_sig
+        if discovered_exp and discovered_sig:
+            exp = exp or discovered_exp
+            sig = sig or discovered_sig
+            auth_source = "page"
+
+    if not (exp and sig):
+        env_exp, env_sig, source = playback_auth_from_env(station)
+        if env_exp and env_sig:
+            exp = env_exp
+            sig = env_sig
+            auth_source = source
+
+    cam["auth_source"] = auth_source
+    cam["exp"] = exp
+    cam["sig"] = sig
 
     file_map = {}
     for rel in cam["files"]:
@@ -892,12 +946,43 @@ def history_check(station: str = Query(...), hours: int = Query(24, ge=1, le=72)
         raise HTTPException(502, f"ตรวจ playback ไม่สำเร็จ: {e}")
 
 
+@app.get("/api/debug/playback-auth")
+def api_debug_playback_auth(station: str = Query(...)):
+    station = validate_station(station)
+    cam_exp = cam_sig = None
+    page_exp = page_sig = None
+    try:
+        cam = fetch_camlist(station)
+        cam_exp = cam.get("exp")
+        cam_sig = cam.get("sig")
+    except Exception:
+        pass
+    try:
+        page_exp, page_sig = try_discover_sig_from_page(station)
+    except Exception:
+        pass
+
+    env_exp, env_sig, env_source = playback_auth_from_env(station)
+    return {
+        "station": station,
+        "camlist_has_exp": bool(cam_exp),
+        "camlist_has_sig": bool(cam_sig),
+        "page_has_exp": bool(page_exp),
+        "page_has_sig": bool(page_sig),
+        "env_has_exp": bool(env_exp),
+        "env_has_sig": bool(env_sig),
+        "env_source": env_source,
+        "effective_source_if_needed": env_source if (env_exp and env_sig) else None,
+    }
+
+
 @app.get("/api/debug/camlist")
 def debug_camlist(station: str = Query(...)):
     station = validate_station(station)
     try:
         cam = fetch_camlist(station)
         exp2, sig2 = try_discover_sig_from_page(station)
+        env_exp, env_sig, env_source = playback_auth_from_env(station)
         return {
             "station": station,
             "count": len(cam["files"]),
@@ -906,6 +991,9 @@ def debug_camlist(station: str = Query(...)):
             "sig_from_camlist": bool(cam.get("sig")),
             "exp_from_page": exp2,
             "sig_from_page": bool(sig2),
+            "exp_from_env": env_exp,
+            "sig_from_env": bool(env_sig),
+            "env_source": env_source,
             "raw_preview": cam["raw_preview"],
         }
     except Exception as e:
