@@ -5,7 +5,7 @@ ENV PYTHONUNBUFFERED=1
 ENV TZ=Asia/Bangkok
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends fonts-noto-core ca-certificates \
+    && apt-get install -y --no-install-recommends fonts-noto-core ca-certificates ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

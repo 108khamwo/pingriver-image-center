@@ -1,47 +1,28 @@
-# Ping River Image Center
+# Ping River Image Center v2
 
-ระบบออนไลน์สำหรับสร้างภาพจริงจาก CCTV + ระดับน้ำแม่น้ำปิง
+เวอร์ชันนี้อัปเดตให้ใช้ CCTV Playback แบบวิดีโอรายชั่วโมง (`hourly/*.mp4`) เพื่อสร้าง GIF จากภาพจริงย้อนหลัง
 
-สถานี:
-- P.1 สะพานนวรัฐ
-- P.67 บ้านแม่แต
+## ใหม่ในเวอร์ชันนี้
+- ใช้ `op=camlist` เพื่ออ่านรายการไฟล์วิดีโอ
+- ใช้ `ffmpeg` เพื่อสกัดภาพจริงจาก MP4
+- รองรับ GIF ย้อนหลังจาก Playback ของ P.1 และ P.67
+- รองรับ GIF เปรียบเทียบ 2 จุด
+- Dockerfile ติดตั้ง `ffmpeg` และฟอนต์ไทยให้แล้ว
 
-ความสามารถ:
-- ดู CCTV ล่าสุดผ่าน backend
-- อ่านระดับน้ำย้อนหลังจากหน้า AppServ
-- สร้าง PNG ล่าสุด 1080x1080
-- สร้าง GIF ย้อนหลัง 1/3/6/12/24/48/72 ชั่วโมง
-- เลือกเฟรมทุก 5/10/15/30 นาที
-- GIF เปรียบเทียบ P.1 + P.67
-- ไม่ต้องเก็บภาพถาวรบน Render
+## Deploy
+อัปโหลดไฟล์ทั้งหมดขึ้น GitHub แล้วเชื่อมกับ Render เป็น Web Service แบบ Docker
+- Language: Docker
+- Instance Type: Free
+- Health Check Path: `/health`
 
-## Deploy บน Render แบบฟรี
-
-1. สร้าง GitHub repository ใหม่ เช่น `pingriver-image-center`
-2. อัปโหลดไฟล์ทั้งหมดในโฟลเดอร์นี้เข้า repository
-3. เข้า Render Dashboard
-4. New > Web Service
-5. เชื่อม GitHub และเลือก repository
-6. Language เลือก `Docker`
-7. Instance Type เลือก `Free`
-8. Health Check Path ใส่ `/health` ถ้ามีช่อง
-9. กด Create Web Service / Deploy
-10. รอ build เสร็จ แล้วเปิด URL `https://ชื่อระบบ.onrender.com`
-
-Dockerfile จะติดตั้ง Noto Sans Thai ให้เอง จึงไม่ต้องแนบไฟล์ฟอนต์
-
-## ทดสอบหลัง Deploy
-
-เปิด:
+## หลัง Deploy
+ลองเปิด:
 - `/health`
-- `/api/status?station=P.1`
-- `/api/status?station=P.67`
 - `/api/history-check?station=P.67&hours=24`
 - `/api/debug/camlist?station=P.67`
 
-ถ้า `/api/history-check` พบภาพย้อนหลังจำนวนมาก แปลว่าพร้อมสร้าง GIF
+จากนั้นเข้าหน้าหลัก `/` แล้วลองสร้าง GIF 24 ชั่วโมง ทุก 15 นาที
 
-## หมายเหตุ Render Free
-
-ไฟล์ที่สร้างเป็นไฟล์ชั่วคราวและส่งให้ดาวน์โหลดทันที
-จึงไม่พึ่ง Persistent Disk และไม่ต้องเก็บภาพทุก 5 นาที
+## หมายเหตุ
+ถ้า playback ของ AppServ ต้องใช้ signed URL (`exp` / `sig`) แต่ backend หาไม่เจอ GIF อาจยังสร้างไม่ได้
+ในกรณีนั้นให้เปิด `/api/debug/camlist?station=P.67` แล้วส่งผลกลับมาเพื่อปรับ parser ต่อ

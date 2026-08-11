@@ -4,9 +4,10 @@ import re
 import json
 import math
 import tempfile
+import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from urllib.parse import urljoin
+from urllib.parse import quote
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
@@ -19,16 +20,19 @@ from fastapi.responses import HTMLResponse, StreamingResponse, FileResponse
 from starlette.background import BackgroundTask
 
 APP_TITLE = "Ping River Image Center"
-BASE_URL = "https://appserv.net/pingriver.php"
+APP_BASE = "https://appserv.net/pingriver.php"
 APP_ORIGIN = "https://appserv.net"
+PLAYBACK_HOST = "https://ns38.appservhosting.com/pingriver/cctv-playback.php"
+
 STATIONS = {
     "P.1": "สะพานนวรัฐ",
-    "P.67": "บ้านแม่แต"
+    "P.67": "บ้านแม่แต",
 }
+
 BKK = timezone(timedelta(hours=7))
-HTTP_TIMEOUT = 25
-MAX_WORKERS = 8
-TMP_DIR = Path(tempfile.gettempdir()) / "pingriver_image_center"
+HTTP_TIMEOUT = 30
+MAX_WORKERS = 6
+TMP_DIR = Path(tempfile.gettempdir()) / "pingriver_image_center_v2"
 TMP_DIR.mkdir(parents=True, exist_ok=True)
 
 PNG_SIZE = 1080
@@ -50,11 +54,11 @@ def make_session():
         read=3,
         backoff_factor=0.7,
         status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET"],
+        allowed_methods=["GET", "HEAD"],
     )
     s.mount("https://", HTTPAdapter(max_retries=retry))
     s.headers.update({
-        "User-Agent": "Mozilla/5.0 (PingRiverImageCenter/1.0)",
+        "User-Agent": "Mozilla/5.0 (PingRiverImageCenter/2.0)",
         "Accept": "*/*",
         "Referer": "https://appserv.net/pingriver.php",
     })
@@ -85,7 +89,33 @@ def fetch_bytes(url: str) -> bytes:
     return r.content
 
 
-def camera_timestamp(value: str):
+def get_font(size, bold=False):
+    candidates = [
+        "/usr/share/fonts/truetype/noto/NotoSansThai-Bold.ttf" if bold else "/usr/share/fonts/truetype/noto/NotoSansThai-Regular.ttf",
+        "/usr/share/fonts/opentype/noto/NotoSansThai-Bold.ttf" if bold else "/usr/share/fonts/opentype/noto/NotoSansThai-Regular.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            return ImageFont.truetype(p, size=size)
+    return ImageFont.load_default()
+
+
+def temp_path(suffix: str):
+    f = tempfile.NamedTemporaryFile(delete=False, suffix=suffix, dir=TMP_DIR)
+    name = f.name
+    f.close()
+    return name
+
+
+def remove_file(path: str):
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def camera_timestamp_from_cache_url(value: str):
     m = re.search(r"cctv_(\d{14})_", value, re.I)
     if not m:
         return None
@@ -95,77 +125,125 @@ def camera_timestamp(value: str):
         return None
 
 
-def _collect_strings(obj):
-    out = []
-    if isinstance(obj, str):
-        out.append(obj)
-    elif isinstance(obj, dict):
-        for k, v in obj.items():
-            out.extend(_collect_strings(k))
-            out.extend(_collect_strings(v))
-    elif isinstance(obj, (list, tuple)):
-        for x in obj:
-            out.extend(_collect_strings(x))
-    return out
-
-
-def extract_camera_urls(raw: str, station: str):
-    strings = [raw]
+def parse_hourly_filename(name: str):
+    m = re.search(r"hourly/(\d{4}-\d{2}-\d{2})_(\d{2})\.mp4$", name)
+    if not m:
+        return None
     try:
-        strings += _collect_strings(json.loads(raw))
+        d = datetime.strptime(m.group(1), "%Y-%m-%d").replace(tzinfo=BKK)
+        return d.replace(hour=int(m.group(2)), minute=0, second=0, microsecond=0)
+    except ValueError:
+        return None
+
+
+def latest_cache_jpg(station: str):
+    raw = fetch_text(f"{APP_BASE}?op=camlist&station={station}&_={int(now_bkk().timestamp()*1000)}")
+    urls = re.findall(
+        rf'((?:https?://appserv\.net)?/cache/{re.escape(station)}/[^"\'<>\s\\]+?\.jpe?g(?:\?[^"\'<>\s\\]*)?)',
+        raw,
+        re.I
+    )
+    clean = []
+    for u in urls:
+        u = u.replace("\\/", "/").replace("&amp;", "&")
+        if u.startswith("/"):
+            u = APP_ORIGIN + u
+        clean.append(u.split("?")[0])
+    clean = list(dict.fromkeys(clean))
+    clean.sort(key=lambda x: camera_timestamp_from_cache_url(x) or datetime(2000, 1, 1, tzinfo=BKK))
+    if not clean:
+        raise RuntimeError(f"ไม่พบภาพล่าสุดของ {station}")
+    return clean[-1], clean
+
+
+def parse_camlist_response(raw: str):
+    obj = None
+    try:
+        obj = json.loads(raw)
     except Exception:
         pass
 
-    soup = BeautifulSoup(raw, "html.parser")
-    for tag in soup.find_all(["img", "a", "source"]):
-        for attr in ("src", "href"):
-            v = tag.get(attr)
-            if v:
-                strings.append(v)
+    files = []
+    exp = None
+    sig = None
+    if isinstance(obj, dict):
+        if isinstance(obj.get("files"), list):
+            files = [str(x) for x in obj.get("files", [])]
+        exp = obj.get("exp")
+        sig = obj.get("sig")
 
-    blob = "\n".join(strings)
-    found = []
+    if not files:
+        files = re.findall(r'hourly/\d{4}-\d{2}-\d{2}_\d{2}\.mp4', raw)
 
-    pat = re.compile(
-        rf'((?:https?://appserv\.net)?/cache/{re.escape(station)}/'
-        rf'[^"\'<>\s\\]+?\.jpe?g(?:\?[^"\'<>\s\\]*)?)',
-        re.I
-    )
-    found.extend(pat.findall(blob))
+    if exp is None:
+        m = re.search(r'"exp"\s*:\s*"?(?P<v>\d+)"?', raw)
+        if m:
+            exp = m.group("v")
+    if sig is None:
+        m = re.search(r'"sig"\s*:\s*"(?P<v>[a-fA-F0-9]+)"', raw)
+        if m:
+            sig = m.group("v")
 
-    filenames = re.findall(r'(cctv_\d{14}_[A-Za-z0-9]+\.jpe?g)', blob, re.I)
-    for fn in filenames:
-        dt = camera_timestamp(fn)
-        if dt:
-            found.append(f"{APP_ORIGIN}/cache/{station}/{dt:%Y}/{dt:%m}/{fn}")
-
-    clean = []
-    seen = set()
-    for u in found:
-        u = u.replace("\\/", "/").replace("&amp;", "&").strip()
-        if u.startswith("/"):
-            u = APP_ORIGIN + u
-        elif not u.startswith("http"):
-            u = urljoin(APP_ORIGIN + "/", u)
-        base = u.split("?")[0]
-        if base not in seen:
-            seen.add(base)
-            clean.append(base)
-
-    clean.sort(key=lambda x: camera_timestamp(x) or datetime(2000, 1, 1, tzinfo=BKK))
-    return clean
+    files = list(dict.fromkeys(files))
+    return {
+        "files": files,
+        "exp": exp,
+        "sig": sig,
+        "raw_preview": raw[:2000]
+    }
 
 
 def fetch_camlist(station: str):
-    url = f"{BASE_URL}?op=camlist&station={station}&_={int(now_bkk().timestamp()*1000)}"
-    raw = fetch_text(url)
-    urls = extract_camera_urls(raw, station)
+    raw = fetch_text(f"{APP_BASE}?op=camlist&station={station}&_={int(now_bkk().timestamp()*1000)}")
+    parsed = parse_camlist_response(raw)
+    if not parsed["files"]:
+        raise RuntimeError(f"ไม่พบไฟล์ playback ของ {station}")
+    return parsed
 
-    if not urls:
-        main_raw = fetch_text(f"{BASE_URL}?station={station}&_={int(now_bkk().timestamp()*1000)}")
-        urls = extract_camera_urls(main_raw, station)
 
-    return urls, raw
+def try_discover_sig_from_page(station: str):
+    html = fetch_text(f"{APP_BASE}?station={station}&_={int(now_bkk().timestamp()*1000)}")
+    exp = None
+    sig = None
+    m = re.search(r'cctv-playback\.php\?op=vid[^"\']*?[?&]exp=(\d+)[^"\']*?[?&]sig=([a-fA-F0-9]+)', html)
+    if m:
+        exp = m.group(1)
+        sig = m.group(2)
+    return exp, sig
+
+
+def playback_url_candidates(station: str, rel_file: str, exp=None, sig=None):
+    rel_enc = quote(rel_file, safe="")
+    urls = []
+    if exp and sig:
+        urls.append(f"{PLAYBACK_HOST}?op=vid&station={station}&f={rel_enc}&exp={exp}&sig={sig}")
+    urls.append(f"{PLAYBACK_HOST}?op=vid&station={station}&f={rel_enc}")
+    return urls
+
+
+def ffmpeg_extract_frame(urls, offset_seconds: int):
+    last_err = None
+    for url in urls:
+        cmd = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel", "error",
+            "-y",
+            "-ss", str(int(offset_seconds)),
+            "-i", url,
+            "-frames:v", "1",
+            "-f", "image2pipe",
+            "-vcodec", "mjpeg",
+            "pipe:1",
+        ]
+        try:
+            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+            if res.returncode == 0 and res.stdout:
+                return res.stdout
+            last_err = res.stderr.decode("utf-8", "ignore")[:500]
+        except Exception as e:
+            last_err = str(e)
+    raise RuntimeError(last_err or "ffmpeg ดึงเฟรมไม่สำเร็จ")
 
 
 def _parse_meter(cell: str):
@@ -235,8 +313,7 @@ def parse_water_history(html: str, station: str):
         text = soup.get_text("\n", strip=True)
         for line in text.splitlines():
             m = re.search(
-                r'(\d{1,2}:\d{2}).*?([+-]?\d+(?:\.\d+)?)\s*m.*?'
-                r'([+-]?\d+(?:\.\d+)?)\s*m',
+                r'(\d{1,2}:\d{2}).*?([+-]?\d+(?:\.\d+)?)\s*m.*?([+-]?\d+(?:\.\d+)?)\s*m',
                 line, re.I
             )
             if m:
@@ -244,75 +321,24 @@ def parse_water_history(html: str, station: str):
                 val = float(m.group(2) if station == "P.1" else m.group(3))
                 rows.append((dt, val))
 
-    d = {}
+    dedup = {}
     for dt, val in rows:
-        d[dt.replace(second=0, microsecond=0)] = val
-    return sorted(d.items(), key=lambda x: x[0])
+        dedup[dt.replace(second=0, microsecond=0)] = val
+    return sorted(dedup.items(), key=lambda x: x[0])
 
 
 def fetch_water_history(station: str):
-    url = f"{BASE_URL}?station={station}&_={int(now_bkk().timestamp()*1000)}"
-    html = fetch_text(url)
+    html = fetch_text(f"{APP_BASE}?station={station}&_={int(now_bkk().timestamp()*1000)}")
     return parse_water_history(html, station), html
 
 
 def nearest_water_level(history, dt):
     if not history:
         return None
-    nearest = min(history, key=lambda x: abs((x[0] - dt).total_seconds()))
-    if abs((nearest[0] - dt).total_seconds()) > 2 * 3600:
+    near = min(history, key=lambda x: abs((x[0] - dt).total_seconds()))
+    if abs((near[0] - dt).total_seconds()) > 2 * 3600:
         return None
-    return nearest[1]
-
-
-def latest_camera(station: str):
-    urls, raw = fetch_camlist(station)
-    if not urls:
-        raise RuntimeError(f"ไม่พบภาพ CCTV ของ {station} จาก camlist")
-    return urls[-1], urls
-
-
-def choose_cameras_for_period(urls, hours: int, step: int):
-    n = now_bkk()
-    cutoff = n - timedelta(hours=hours)
-    with_dt = [(camera_timestamp(u), u) for u in urls]
-    with_dt = [(dt, u) for dt, u in with_dt if dt and cutoff <= dt <= n + timedelta(minutes=10)]
-    if not with_dt:
-        return []
-
-    with_dt.sort()
-    chosen = []
-    cursor = cutoff
-    tolerance = timedelta(minutes=max(step, 7))
-    while cursor <= n:
-        dt, u = min(with_dt, key=lambda x: abs(x[0] - cursor))
-        if abs(dt - cursor) <= tolerance:
-            if not chosen or chosen[-1][1] != u:
-                chosen.append((dt, u))
-        cursor += timedelta(minutes=step)
-
-    if not chosen:
-        chosen = with_dt
-    return chosen
-
-
-def font_path(bold=False):
-    candidates = [
-        "/usr/share/fonts/truetype/noto/NotoSansThai-Bold.ttf" if bold else "/usr/share/fonts/truetype/noto/NotoSansThai-Regular.ttf",
-        "/usr/share/fonts/opentype/noto/NotoSansThai-Bold.ttf" if bold else "/usr/share/fonts/opentype/noto/NotoSansThai-Regular.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    ]
-    for p in candidates:
-        if os.path.exists(p):
-            return p
-    return None
-
-
-def get_font(size, bold=False):
-    p = font_path(bold)
-    if p:
-        return ImageFont.truetype(p, size=size)
-    return ImageFont.load_default()
+    return near[1]
 
 
 def render_report_frame(cctv_bytes: bytes, station: str, captured_at: datetime, water_level, size: int):
@@ -328,15 +354,10 @@ def render_report_frame(cctv_bytes: bytes, station: str, captured_at: datetime, 
     header_h = int(size * 0.12)
     footer_h = int(size * 0.23)
 
-    draw.rounded_rectangle(
-        (margin, margin, size - margin, margin + header_h),
-        radius=int(size * 0.02), fill=(25, 59, 101)
-    )
-    draw.text(
-        (int(margin * 1.5), margin + int(header_h * 0.17)),
-        f"{station}  {STATIONS[station]}",
-        font=title_font, fill="white"
-    )
+    draw.rounded_rectangle((margin, margin, size - margin, margin + header_h),
+                           radius=int(size * 0.02), fill=(25, 59, 101))
+    draw.text((int(margin * 1.5), margin + int(header_h * 0.17)),
+              f"{station}  {STATIONS[station]}", font=title_font, fill="white")
 
     img_top = margin + header_h + int(size * 0.02)
     img_bottom = size - margin - footer_h - int(size * 0.02)
@@ -345,12 +366,8 @@ def render_report_frame(cctv_bytes: bytes, station: str, captured_at: datetime, 
 
     try:
         im = Image.open(io.BytesIO(cctv_bytes)).convert("RGB")
-        im = ImageOps.fit(
-            im,
-            (img_right - img_left, img_bottom - img_top),
-            method=Image.Resampling.LANCZOS,
-            centering=(0.5, 0.5),
-        )
+        im = ImageOps.fit(im, (img_right - img_left, img_bottom - img_top),
+                          method=Image.Resampling.LANCZOS, centering=(0.5, 0.5))
         canvas.paste(im, (img_left, img_top))
     except Exception:
         draw.rectangle((img_left, img_top, img_right, img_bottom), fill=(30, 38, 49))
@@ -358,10 +375,8 @@ def render_report_frame(cctv_bytes: bytes, station: str, captured_at: datetime, 
 
     y1 = size - margin - footer_h
     y2 = size - margin
-    draw.rounded_rectangle(
-        (margin, y1, size - margin, y2),
-        radius=int(size * 0.02), fill=(20, 43, 72)
-    )
+    draw.rounded_rectangle((margin, y1, size - margin, y2),
+                           radius=int(size * 0.02), fill=(20, 43, 72))
 
     level_text = "-" if water_level is None else f"{water_level:.2f} เมตร"
     draw.text((int(margin * 1.5), y1 + int(footer_h * 0.14)), "ระดับน้ำ", font=label_font, fill=(184, 211, 245))
@@ -371,79 +386,96 @@ def render_report_frame(cctv_bytes: bytes, station: str, captured_at: datetime, 
     x_time = int(size * 0.53)
     draw.text((x_time, y1 + int(footer_h * 0.14)), "เวลา CCTV", font=label_font, fill=(184, 211, 245))
     draw.text((x_time, y1 + int(footer_h * 0.43)), time_text, font=small_font, fill="white")
-    draw.text(
-        (x_time, y1 + int(footer_h * 0.68)),
-        "ข้อมูล: AppServ / ระบบโทรมาตร กรมชลประทาน",
-        font=small_font, fill=(210, 220, 230)
-    )
+    draw.text((x_time, y1 + int(footer_h * 0.68)),
+              "ข้อมูล: AppServ / ระบบโทรมาตร กรมชลประทาน",
+              font=small_font, fill=(210, 220, 230))
     return canvas
 
 
-def download_many(items):
-    result = [None] * len(items)
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futures = {
-            ex.submit(fetch_bytes, u + ("&" if "?" in u else "?") + f"t={int(now_bkk().timestamp())}"): i
-            for i, (_, u) in enumerate(items)
-        }
-        for f in as_completed(futures):
-            i = futures[f]
-            try:
-                b = f.result()
-                dt, u = items[i]
-                result[i] = (dt, u, b)
-            except Exception:
-                result[i] = None
-    return [x for x in result if x is not None]
-
-
-def temp_path(suffix: str):
-    f = tempfile.NamedTemporaryFile(delete=False, suffix=suffix, dir=TMP_DIR)
-    p = f.name
-    f.close()
-    return p
-
-
-def remove_file(path: str):
-    try:
-        os.unlink(path)
-    except OSError:
-        pass
-
-
-def build_png(station: str):
-    url, _ = latest_camera(station)
-    dt = camera_timestamp(url) or now_bkk()
+def latest_png(station: str):
+    url, _ = latest_cache_jpg(station)
+    dt = camera_timestamp_from_cache_url(url) or now_bkk()
     history, _ = fetch_water_history(station)
     level = nearest_water_level(history, dt)
-    cctv = fetch_bytes(url + f"?t={int(now_bkk().timestamp())}")
-    im = render_report_frame(cctv, station, dt, level, PNG_SIZE)
+    b = fetch_bytes(url + f"?t={int(now_bkk().timestamp())}")
+    img = render_report_frame(b, station, dt, level, PNG_SIZE)
     path = temp_path(".png")
-    im.save(path, "PNG", optimize=True)
+    img.save(path, "PNG", optimize=True)
     return path
 
 
+def build_slot_tasks(station: str, hours: int, step: int):
+    cam = fetch_camlist(station)
+    exp = cam.get("exp")
+    sig = cam.get("sig")
+    if not (exp and sig):
+        discovered_exp, discovered_sig = try_discover_sig_from_page(station)
+        exp = exp or discovered_exp
+        sig = sig or discovered_sig
+
+    file_map = {}
+    for rel in cam["files"]:
+        dt = parse_hourly_filename(rel)
+        if dt:
+            file_map[dt] = rel
+
+    n = now_bkk()
+    start = n - timedelta(hours=hours)
+    start = start.replace(minute=0, second=0, microsecond=0)
+    tasks = []
+    cursor = start
+    while cursor <= n:
+        hour_dt = cursor.replace(minute=0, second=0, microsecond=0)
+        rel = file_map.get(hour_dt)
+        if rel:
+            offset = int((cursor - hour_dt).total_seconds())
+            tasks.append({
+                "slot": cursor,
+                "rel_file": rel,
+                "offset": offset,
+                "urls": playback_url_candidates(station, rel, exp=exp, sig=sig),
+            })
+        cursor += timedelta(minutes=step)
+
+    uniq = []
+    seen = set()
+    for t in tasks:
+        key = (t["slot"], t["rel_file"], t["offset"])
+        if key not in seen:
+            seen.add(key)
+            uniq.append(t)
+    return uniq, cam
+
+
+def extract_task_frame(task):
+    b = ffmpeg_extract_frame(task["urls"], task["offset"])
+    return task["slot"], b
+
+
 def build_gif(station: str, hours: int, step: int):
-    urls, _ = fetch_camlist(station)
-    items = choose_cameras_for_period(urls, hours, step)
-    if len(items) < 2:
-        raise RuntimeError(
-            f"พบภาพย้อนหลังของ {station} เพียง {len(items)} ภาพ "
-            "camlist อาจส่งรายการไม่ครบหรือรูปแบบ endpoint มีการเปลี่ยนแปลง"
-        )
+    tasks, cam = build_slot_tasks(station, hours, step)
+    if len(tasks) < 2:
+        raise RuntimeError("จำนวนช่วงเวลาที่สร้างได้ไม่พอสำหรับทำ GIF")
 
     history, _ = fetch_water_history(station)
-    downloaded = download_many(items)
-    if len(downloaded) < 2:
-        raise RuntimeError("ดาวน์โหลดภาพ CCTV ได้ไม่เพียงพอสำหรับสร้าง GIF")
+    results = []
+    with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, max(2, len(tasks)))) as ex:
+        futs = [ex.submit(extract_task_frame, t) for t in tasks]
+        for f in as_completed(futs):
+            results.append(f.result())
+
+    results.sort(key=lambda x: x[0])
 
     frames = []
-    for dt, url, b in downloaded:
-        level = nearest_water_level(history, dt)
-        fr = render_report_frame(b, station, dt, level, GIF_SIZE)
+    for slot, b in results:
+        level = nearest_water_level(history, slot)
+        fr = render_report_frame(b, station, slot, level, GIF_SIZE)
         fr = fr.quantize(colors=128, method=Image.Quantize.MEDIANCUT)
         frames.append(fr)
 
+    if len(frames) < 2:
+        raise RuntimeError("ดึงเฟรมจากวิดีโอได้ไม่พอสำหรับทำ GIF")
+
     path = temp_path(".gif")
     frames[0].save(
         path,
@@ -454,76 +486,47 @@ def build_gif(station: str, hours: int, step: int):
         optimize=False,
         disposal=2,
     )
-    return path, len(frames)
-
-
-def nearest_camera_to_slot(items, slot, tolerance_minutes):
-    if not items:
-        return None
-    best = min(items, key=lambda x: abs(x[0] - slot))
-    if abs(best[0] - slot) > timedelta(minutes=tolerance_minutes):
-        return None
-    return best
-
-
-def render_combined_frame(left_b, right_b, dt, p1_level, p67_level, size=640):
-    left = render_report_frame(left_b, "P.1", dt, p1_level, size)
-    right = render_report_frame(right_b, "P.67", dt, p67_level, size)
-    canvas = Image.new("RGB", (size * 2, size), (10, 20, 34))
-    canvas.paste(left, (0, 0))
-    canvas.paste(right, (size, 0))
-    return canvas.quantize(colors=128, method=Image.Quantize.MEDIANCUT)
+    return path, len(frames), len(tasks), cam
 
 
 def build_combined_gif(hours: int, step: int):
-    p1_urls, _ = fetch_camlist("P.1")
-    p67_urls, _ = fetch_camlist("P.67")
-    p1_items = choose_cameras_for_period(p1_urls, hours, step)
-    p67_items = choose_cameras_for_period(p67_urls, hours, step)
-    if len(p1_items) < 2 or len(p67_items) < 2:
-        raise RuntimeError("ภาพย้อนหลังของ P.1 หรือ P.67 ไม่เพียงพอสำหรับ GIF เปรียบเทียบ")
+    p1_tasks, p1_cam = build_slot_tasks("P.1", hours, step)
+    p67_tasks, p67_cam = build_slot_tasks("P.67", hours, step)
+    map1 = {t["slot"]: t for t in p1_tasks}
+    map67 = {t["slot"]: t for t in p67_tasks}
+    common_slots = sorted(set(map1.keys()) & set(map67.keys()))
+    if len(common_slots) < 2:
+        raise RuntimeError("ช่วงเวลาที่ P.1 และ P.67 ซ้อนกันมีไม่พอสำหรับ GIF เปรียบเทียบ")
 
     h1, _ = fetch_water_history("P.1")
     h67, _ = fetch_water_history("P.67")
-    n = now_bkk()
-    start = n - timedelta(hours=hours)
-    slots = []
-    cursor = start
-    while cursor <= n:
-        slots.append(cursor)
-        cursor += timedelta(minutes=step)
 
-    pairs = []
-    for slot in slots:
-        a = nearest_camera_to_slot(p1_items, slot, max(step, 10))
-        b = nearest_camera_to_slot(p67_items, slot, max(step, 10))
-        if a and b:
-            pairs.append((slot, a, b))
+    tasks = []
+    for slot in common_slots:
+        tasks.append(("P.1", slot, map1[slot]))
+        tasks.append(("P.67", slot, map67[slot]))
 
-    if len(pairs) < 2:
-        raise RuntimeError("ไม่สามารถจับคู่เวลา P.1 กับ P.67 ได้เพียงพอ")
-
-    unique_items = []
-    seen = set()
-    for _, a, b in pairs:
-        for item in (a, b):
-            if item[1] not in seen:
-                seen.add(item[1])
-                unique_items.append(item)
-
-    downloaded = download_many(unique_items)
-    bytes_map = {u: bb for dt, u, bb in downloaded}
+    extracted = {}
+    with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, max(2, len(tasks)))) as ex:
+        fut_map = {ex.submit(extract_task_frame, t): (station, slot) for station, slot, t in tasks}
+        for fut in as_completed(fut_map):
+            station, slot = fut_map[fut]
+            slot2, b = fut.result()
+            extracted[(station, slot2)] = b
 
     frames = []
-    for slot, a, b in pairs:
-        if a[1] not in bytes_map or b[1] not in bytes_map:
+    for slot in common_slots:
+        if ("P.1", slot) not in extracted or ("P.67", slot) not in extracted:
             continue
-        level1 = nearest_water_level(h1, slot)
-        level67 = nearest_water_level(h67, slot)
-        frames.append(render_combined_frame(bytes_map[a[1]], bytes_map[b[1]], slot, level1, level67))
+        left = render_report_frame(extracted[("P.1", slot)], "P.1", slot, nearest_water_level(h1, slot), GIF_SIZE)
+        right = render_report_frame(extracted[("P.67", slot)], "P.67", slot, nearest_water_level(h67, slot), GIF_SIZE)
+        canvas = Image.new("RGB", (GIF_SIZE * 2, GIF_SIZE), (10, 20, 34))
+        canvas.paste(left, (0, 0))
+        canvas.paste(right, (GIF_SIZE, 0))
+        frames.append(canvas.quantize(colors=128, method=Image.Quantize.MEDIANCUT))
 
     if len(frames) < 2:
-        raise RuntimeError("ดาวน์โหลดภาพสำหรับ GIF เปรียบเทียบไม่เพียงพอ")
+        raise RuntimeError("สร้าง GIF เปรียบเทียบไม่สำเร็จ")
 
     path = temp_path(".gif")
     frames[0].save(
@@ -535,20 +538,20 @@ def build_combined_gif(hours: int, step: int):
         optimize=False,
         disposal=2,
     )
-    return path, len(frames)
+    return path, len(frames), len(common_slots), {"P.1": p1_cam, "P.67": p67_cam}
 
 
-HTML = r'''
+HTML = """
 <!doctype html>
-<html lang="th">
+<html lang=\"th\">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Ping River Image Center</title>
+<meta charset=\"utf-8\">
+<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">
+<title>Ping River Image Center v2</title>
 <style>
 :root{color-scheme:dark}
 *{box-sizing:border-box}
-body{margin:0;font-family:system-ui,-apple-system,"Noto Sans Thai",sans-serif;background:#07111f;color:#eef5ff}
+body{margin:0;font-family:system-ui,-apple-system,\"Noto Sans Thai\",sans-serif;background:#07111f;color:#eef5ff}
 .wrap{max-width:1120px;margin:auto;padding:24px}
 h1{font-size:clamp(26px,4vw,44px);margin:0 0 6px}
 .sub{color:#99acc4;margin-bottom:24px}
@@ -567,68 +570,68 @@ select{background:#0a1728;color:white;border:1px solid #36506c;padding:9px;borde
 </style>
 </head>
 <body>
-<div class="wrap">
-  <h1>🌊 Ping River Image Center</h1>
-  <div class="sub">สร้างภาพ PNG และ GIF CCTV + ระดับน้ำ P.1 / P.67 แบบดึงข้อมูลเมื่อสั่งสร้าง</div>
+<div class=\"wrap\">
+  <h1>🌊 Ping River Image Center v2</h1>
+  <div class=\"sub\">เวอร์ชันนี้ใช้ CCTV Playback แบบวิดีโอรายชั่วโมงเพื่อสร้าง GIF จากภาพจริงย้อนหลัง</div>
 
-  <div class="grid">
-    <section class="card" data-station="P.1">
+  <div class=\"grid\">
+    <section class=\"card\" data-station=\"P.1\">
       <h2>P.1 สะพานนวรัฐ</h2>
-      <div class="preview"><img src="/camera/latest?station=P.1&t=1" alt="P.1 CCTV"></div>
-      <div class="big" id="level-P1">กำลังอ่านระดับน้ำ…</div>
-      <div class="status" id="status-P1"></div>
-      <div class="row">
-        <a class="btn" href="/download/png?station=P.1">สร้าง PNG ล่าสุด</a>
-        <button class="alt" onclick="refreshCamera('P.1')">รีเฟรช CCTV</button>
+      <div class=\"preview\"><img src=\"/camera/latest?station=P.1&t=1\" alt=\"P.1 CCTV\"></div>
+      <div class=\"big\" id=\"level-P1\">กำลังอ่านระดับน้ำ…</div>
+      <div class=\"status\" id=\"status-P1\"></div>
+      <div class=\"row\">
+        <a class=\"btn\" href=\"/download/png?station=P.1\">สร้าง PNG ล่าสุด</a>
+        <button class=\"alt\" onclick=\"refreshCamera('P.1')\">รีเฟรช CCTV</button>
       </div>
     </section>
 
-    <section class="card" data-station="P.67">
+    <section class=\"card\" data-station=\"P.67\">
       <h2>P.67 บ้านแม่แต</h2>
-      <div class="preview"><img src="/camera/latest?station=P.67&t=1" alt="P.67 CCTV"></div>
-      <div class="big" id="level-P67">กำลังอ่านระดับน้ำ…</div>
-      <div class="status" id="status-P67"></div>
-      <div class="row">
-        <a class="btn" href="/download/png?station=P.67">สร้าง PNG ล่าสุด</a>
-        <button class="alt" onclick="refreshCamera('P.67')">รีเฟรช CCTV</button>
+      <div class=\"preview\"><img src=\"/camera/latest?station=P.67&t=1\" alt=\"P.67 CCTV\"></div>
+      <div class=\"big\" id=\"level-P67\">กำลังอ่านระดับน้ำ…</div>
+      <div class=\"status\" id=\"status-P67\"></div>
+      <div class=\"row\">
+        <a class=\"btn\" href=\"/download/png?station=P.67\">สร้าง PNG ล่าสุด</a>
+        <button class=\"alt\" onclick=\"refreshCamera('P.67')\">รีเฟรช CCTV</button>
       </div>
     </section>
   </div>
 
-  <section class="card tools">
-    <h2>สร้าง GIF ย้อนหลัง</h2>
-    <div class="row">
+  <section class=\"card tools\">
+    <h2>สร้าง GIF ย้อนหลังจาก Playback</h2>
+    <div class=\"row\">
       <label>ย้อนหลัง
-        <select id="hours">
-          <option value="1">1 ชั่วโมง</option>
-          <option value="3">3 ชั่วโมง</option>
-          <option value="6">6 ชั่วโมง</option>
-          <option value="12">12 ชั่วโมง</option>
-          <option value="24" selected>24 ชั่วโมง</option>
-          <option value="48">48 ชั่วโมง</option>
-          <option value="72">72 ชั่วโมง</option>
+        <select id=\"hours\">
+          <option value=\"1\">1 ชั่วโมง</option>
+          <option value=\"3\">3 ชั่วโมง</option>
+          <option value=\"6\">6 ชั่วโมง</option>
+          <option value=\"12\">12 ชั่วโมง</option>
+          <option value=\"24\" selected>24 ชั่วโมง</option>
+          <option value=\"48\">48 ชั่วโมง</option>
+          <option value=\"72\">72 ชั่วโมง</option>
         </select>
       </label>
-      <label>เลือกภาพทุก
-        <select id="step">
-          <option value="5">5 นาที</option>
-          <option value="10">10 นาที</option>
-          <option value="15" selected>15 นาที</option>
-          <option value="30">30 นาที</option>
+      <label>ดึงภาพทุก
+        <select id=\"step\">
+          <option value=\"5\">5 นาที</option>
+          <option value=\"10\">10 นาที</option>
+          <option value=\"15\" selected>15 นาที</option>
+          <option value=\"30\">30 นาที</option>
         </select>
       </label>
     </div>
-    <div class="row">
-      <button onclick="makeGif('P.1')">GIF P.1</button>
-      <button onclick="makeGif('P.67')">GIF P.67</button>
-      <button class="alt" onclick="makeCombined()">GIF เปรียบเทียบ P.1 + P.67</button>
-      <button class="alt" onclick="checkHistory()">ตรวจจำนวนภาพย้อนหลัง</button>
+    <div class=\"row\">
+      <button onclick=\"makeGif('P.1')\">GIF P.1</button>
+      <button onclick=\"makeGif('P.67')\">GIF P.67</button>
+      <button class=\"alt\" onclick=\"makeCombined()\">GIF เปรียบเทียบ P.1 + P.67</button>
+      <button class=\"alt\" onclick=\"checkHistory()\">ตรวจไฟล์ Playback</button>
     </div>
-    <div class="status" id="workStatus"></div>
+    <div class=\"status\" id=\"workStatus\"></div>
   </section>
 
-  <div class="note">
-    ระบบนี้ไม่เก็บ CCTV ทุก 5 นาทีบน Render — ตอนกดสร้าง ระบบจะขอรายการภาพย้อนหลังจาก AppServ แล้วสร้างไฟล์ชั่วคราวให้ดาวน์โหลดทันที
+  <div class=\"note\">
+    ถ้า PNG ใช้ได้แต่ GIF มี error ให้เปิด <code>/api/debug/camlist?station=P.67</code> แล้วส่งผลกลับมา
   </div>
 </div>
 <script>
@@ -641,7 +644,7 @@ async function loadStatus(station){
     const j=await r.json();
     if(!r.ok) throw new Error(j.detail||'error');
     lv.textContent = j.water_level==null ? 'ระดับน้ำ: -' : `ระดับน้ำ ${j.water_level.toFixed(2)} เมตร`;
-    el.textContent=`CCTV ล่าสุด ${j.camera_time||'-'} | พบภาพใน camlist ${j.camera_count} ภาพ`;
+    el.textContent=`CCTV ล่าสุด ${j.camera_time||'-'} | Playback files ${j.playback_count}`;
   }catch(e){
     lv.textContent='อ่านข้อมูลไม่ได้';
     el.textContent=e.message;
@@ -656,7 +659,7 @@ function refreshCamera(station){
 function makeGif(station){
   const h=document.getElementById('hours').value;
   const s=document.getElementById('step').value;
-  document.getElementById('workStatus').textContent='กำลังสร้าง GIF... อาจใช้เวลาสักครู่';
+  document.getElementById('workStatus').textContent='กำลังสร้าง GIF จาก Playback... อาจใช้เวลาสักครู่';
   location.href=`/download/gif?station=${encodeURIComponent(station)}&hours=${h}&step=${s}`;
 }
 function makeCombined(){
@@ -674,14 +677,14 @@ async function checkHistory(){
       fetch(`/api/history-check?station=P.1&hours=${h}`).then(r=>r.json()),
       fetch(`/api/history-check?station=P.67&hours=${h}`).then(r=>r.json())
     ]);
-    el.textContent=`P.1: ${a.in_period}/${a.total_camlist} ภาพ | P.67: ${b.in_period}/${b.total_camlist} ภาพ`;
+    el.textContent=`P.1: ${a.in_period}/${a.total_files} ไฟล์ชั่วโมง | P.67: ${b.in_period}/${b.total_files} ไฟล์ชั่วโมง`;
   }catch(e){el.textContent='ตรวจไม่สำเร็จ: '+e.message}
 }
 loadStatus('P.1'); loadStatus('P.67');
 </script>
 </body>
 </html>
-'''
+"""
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -698,18 +701,19 @@ def health():
 def api_status(station: str = Query(...)):
     station = validate_station(station)
     try:
-        cam_url, urls = latest_camera(station)
-        cam_dt = camera_timestamp(cam_url)
+        latest_url, _ = latest_cache_jpg(station)
+        latest_dt = camera_timestamp_from_cache_url(latest_url)
         history, _ = fetch_water_history(station)
-        level = nearest_water_level(history, cam_dt or now_bkk())
+        level = nearest_water_level(history, latest_dt or now_bkk())
+        cam = fetch_camlist(station)
         return {
             "station": station,
             "name": STATIONS[station],
             "water_level": level,
-            "camera_time": cam_dt.strftime("%d/%m/%Y %H:%M:%S") if cam_dt else None,
-            "camera_count": len(urls),
-            "latest_camera_url": cam_url,
-            "water_points": len(history),
+            "camera_time": latest_dt.strftime("%d/%m/%Y %H:%M:%S") if latest_dt else None,
+            "playback_count": len(cam["files"]),
+            "exp": cam.get("exp"),
+            "sig_present": bool(cam.get("sig")),
         }
     except Exception as e:
         raise HTTPException(502, f"ดึงข้อมูลต้นทางไม่สำเร็จ: {e}")
@@ -719,31 +723,40 @@ def api_status(station: str = Query(...)):
 def history_check(station: str = Query(...), hours: int = Query(24, ge=1, le=72)):
     station = validate_station(station)
     try:
-        urls, _ = fetch_camlist(station)
+        cam = fetch_camlist(station)
         cutoff = now_bkk() - timedelta(hours=hours)
-        in_period = [u for u in urls if camera_timestamp(u) and camera_timestamp(u) >= cutoff]
+        dts = [parse_hourly_filename(x) for x in cam["files"]]
+        dts = [x for x in dts if x]
+        in_period = [x for x in dts if x >= cutoff.replace(minute=0, second=0, microsecond=0)]
         return {
             "station": station,
             "hours": hours,
-            "total_camlist": len(urls),
+            "total_files": len(dts),
             "in_period": len(in_period),
-            "first": camera_timestamp(urls[0]).isoformat() if urls and camera_timestamp(urls[0]) else None,
-            "last": camera_timestamp(urls[-1]).isoformat() if urls and camera_timestamp(urls[-1]) else None,
+            "first": dts[0].isoformat() if dts else None,
+            "last": dts[-1].isoformat() if dts else None,
+            "sig_present": bool(cam.get("sig")),
+            "exp": cam.get("exp"),
         }
     except Exception as e:
-        raise HTTPException(502, f"ตรวจ camlist ไม่สำเร็จ: {e}")
+        raise HTTPException(502, f"ตรวจ playback ไม่สำเร็จ: {e}")
 
 
 @app.get("/api/debug/camlist")
 def debug_camlist(station: str = Query(...)):
     station = validate_station(station)
     try:
-        urls, raw = fetch_camlist(station)
+        cam = fetch_camlist(station)
+        exp2, sig2 = try_discover_sig_from_page(station)
         return {
             "station": station,
-            "count": len(urls),
-            "urls": urls[-20:],
-            "raw_preview": raw[:1500],
+            "count": len(cam["files"]),
+            "sample_files": cam["files"][:10],
+            "exp_from_camlist": cam.get("exp"),
+            "sig_from_camlist": bool(cam.get("sig")),
+            "exp_from_page": exp2,
+            "sig_from_page": bool(sig2),
+            "raw_preview": cam["raw_preview"],
         }
     except Exception as e:
         raise HTTPException(502, str(e))
@@ -753,7 +766,7 @@ def debug_camlist(station: str = Query(...)):
 def camera_latest(station: str = Query(...)):
     station = validate_station(station)
     try:
-        url, _ = latest_camera(station)
+        url, _ = latest_cache_jpg(station)
         b = fetch_bytes(url + f"?t={int(now_bkk().timestamp())}")
         return StreamingResponse(io.BytesIO(b), media_type="image/jpeg",
                                  headers={"Cache-Control": "no-store"})
@@ -765,12 +778,10 @@ def camera_latest(station: str = Query(...)):
 def download_png(station: str = Query(...)):
     station = validate_station(station)
     try:
-        path = build_png(station)
+        path = latest_png(station)
         filename = f"{station.replace('.','')}_latest_{now_bkk():%Y%m%d_%H%M}.png"
-        return FileResponse(
-            path, media_type="image/png", filename=filename,
-            background=BackgroundTask(remove_file, path)
-        )
+        return FileResponse(path, media_type="image/png", filename=filename,
+                            background=BackgroundTask(remove_file, path))
     except Exception as e:
         raise HTTPException(502, f"สร้าง PNG ไม่สำเร็จ: {e}")
 
@@ -785,39 +796,28 @@ def download_gif(
     if step not in (5, 10, 15, 30):
         raise HTTPException(400, "step ต้องเป็น 5, 10, 15 หรือ 30 นาที")
     estimated = math.ceil(hours * 60 / step)
-    if estimated > 320:
-        raise HTTPException(400, "จำนวนเฟรมมากเกินไป กรุณาเพิ่ม step หรือลดจำนวนชั่วโมง")
+    if estimated > 240:
+        raise HTTPException(400, "จำนวนเฟรมมากเกินไปสำหรับ Render Free กรุณาเพิ่ม step หรือลดชั่วโมง")
     try:
-        path, frames = build_gif(station, hours, step)
+        path, frames, tasks, cam = build_gif(station, hours, step)
         filename = f"{station.replace('.','')}_{hours}h_step{step}m_{frames}frames.gif"
-        return FileResponse(
-            path, media_type="image/gif", filename=filename,
-            background=BackgroundTask(remove_file, path)
-        )
+        return FileResponse(path, media_type="image/gif", filename=filename,
+                            background=BackgroundTask(remove_file, path))
     except Exception as e:
         raise HTTPException(502, f"สร้าง GIF ไม่สำเร็จ: {e}")
 
 
 @app.get("/download/gif-combined")
-def download_gif_combined(
-    hours: int = Query(24, ge=1, le=72),
-    step: int = Query(15),
-):
+def download_gif_combined(hours: int = Query(24, ge=1, le=72), step: int = Query(15)):
     if step not in (5, 10, 15, 30):
         raise HTTPException(400, "step ต้องเป็น 5, 10, 15 หรือ 30 นาที")
     estimated = math.ceil(hours * 60 / step)
-    if estimated > 180:
-        raise HTTPException(
-            400,
-            "GIF เปรียบเทียบมี 2 ภาพต่อเฟรม กรุณาใช้ไม่เกินประมาณ 180 เฟรม "
-            "(เช่น 24 ชม. เลือกทุก 10/15/30 นาที)"
-        )
+    if estimated > 120:
+        raise HTTPException(400, "GIF เปรียบเทียบใช้ทรัพยากรมาก กรุณาเลือก step มากขึ้นหรือลดชั่วโมง")
     try:
-        path, frames = build_combined_gif(hours, step)
+        path, frames, slots, meta = build_combined_gif(hours, step)
         filename = f"P1_P67_compare_{hours}h_step{step}m_{frames}frames.gif"
-        return FileResponse(
-            path, media_type="image/gif", filename=filename,
-            background=BackgroundTask(remove_file, path)
-        )
+        return FileResponse(path, media_type="image/gif", filename=filename,
+                            background=BackgroundTask(remove_file, path))
     except Exception as e:
         raise HTTPException(502, f"สร้าง GIF เปรียบเทียบไม่สำเร็จ: {e}")
