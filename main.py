@@ -21,7 +21,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse, StreamingResponse, FileResponse
 from starlette.background import BackgroundTask
 
-APP_TITLE = "Ping River Image Center"
+APP_TITLE = "CCTV Ping River"
 APP_BASE = "https://appserv.net/pingriver.php"
 APP_ORIGIN = "https://appserv.net"
 PLAYBACK_HOST = "https://ns38.appservhosting.com/pingriver/cctv-playback.php"
@@ -64,7 +64,7 @@ def make_session():
     )
     s.mount("https://", HTTPAdapter(max_retries=retry))
     s.headers.update({
-        "User-Agent": "Mozilla/5.0 (PingRiverImageCenter/30.0)",
+        "User-Agent": "Mozilla/5.0 (CCTVPingRiver/31.0)",
         "Accept": "*/*",
         "Referer": "https://appserv.net/pingriver.php",
     })
@@ -1086,7 +1086,7 @@ def latest_water_level(history):
     return latest_level, latest_dt.astimezone(BKK)
 
 
-def render_report_frame(cctv_bytes: bytes, station: str, captured_at: datetime, water_level, size: int, water_level_dt=None, fixed_period_text=None, zoom_timestamp=True):
+def render_report_frame(cctv_bytes: bytes, station: str, captured_at: datetime, water_level, size: int, water_level_dt=None, fixed_period_text=None, zoom_timestamp=False):
     # ปรับโทนโดยรวมให้เป็นสีฟ้ามากขึ้น
     canvas = Image.new("RGB", (size, size), (10, 32, 60))
     draw = ImageDraw.Draw(canvas)
@@ -1676,7 +1676,7 @@ HTML = """
 <head>
 <meta charset=\"utf-8\">
 <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">
-<title>Ping River Image Center v30</title>
+<title>CCTV Ping River v31</title>
 <style>
 :root{color-scheme:dark}
 *{box-sizing:border-box}
@@ -1703,35 +1703,34 @@ select{background:#0a1728;color:white;border:1px solid #36506c;padding:9px;borde
 </head>
 <body>
 <div class=\"wrap\">
-  <h1>🌊 Ping River Image Center v30</h1>
-  <div class=\"sub\">เวอร์ชันนี้ใช้ CCTV Playback แบบวิดีโอรายชั่วโมงเพื่อสร้าง GIF จากภาพจริงย้อนหลัง</div>
-
+  <h1>🌊 CCTV Ping River v31</h1>
+  
   <div class=\"grid\">
-    <section class=\"card\" data-station=\"P.1\">
-      <h2>P.1 สะพานนวรัฐ</h2>
-      <div class=\"preview\"><img src=\"/camera/latest?station=P.1&t=1\" alt=\"P.1 CCTV\"></div>
-      <div class=\"big\" id=\"level-P1\">กำลังอ่านระดับน้ำ…</div>
-      <div class=\"status\" id=\"status-P1\"></div>
-      <div class=\"row\">
-        <a class=\"btn\" href=\"/download/png?station=P.1\">สร้าง PNG ล่าสุด</a>
-        <button class=\"alt\" onclick=\"refreshCamera('P.1')\">รีเฟรช CCTV</button>
-      </div>
-    </section>
-
     <section class=\"card\" data-station=\"P.67\">
       <h2>P.67 บ้านแม่แต</h2>
       <div class=\"preview\"><img src=\"/camera/latest?station=P.67&t=1\" alt=\"P.67 CCTV\"></div>
       <div class=\"big\" id=\"level-P67\">กำลังอ่านระดับน้ำ…</div>
       <div class=\"status\" id=\"status-P67\"></div>
       <div class=\"row\">
-        <a class=\"btn\" href=\"/download/png?station=P.67\">สร้าง PNG ล่าสุด</a>
+        <button class=\"btn\" onclick=\"saveLatest('P.67')\">รูป CCTV ล่าสุด</button>
         <button class=\"alt\" onclick=\"refreshCamera('P.67')\">รีเฟรช CCTV</button>
+      </div>
+    </section>
+
+    <section class=\"card\" data-station=\"P.1\">
+      <h2>P.1 สะพานนวรัฐ</h2>
+      <div class=\"preview\"><img src=\"/camera/latest?station=P.1&t=1\" alt=\"P.1 CCTV\"></div>
+      <div class=\"big\" id=\"level-P1\">กำลังอ่านระดับน้ำ…</div>
+      <div class=\"status\" id=\"status-P1\"></div>
+      <div class=\"row\">
+        <button class=\"btn\" onclick=\"saveLatest('P.1')\">รูป CCTV ล่าสุด</button>
+        <button class=\"alt\" onclick=\"refreshCamera('P.1')\">รีเฟรช CCTV</button>
       </div>
     </section>
   </div>
 
   <section class=\"card tools\">
-    <h2>สร้าง GIF ย้อนหลังจาก Playback</h2>
+    <h2>สร้างไฟล์ภาพ .GIF การเปลี่ยนแปลงระดับน้ำ</h2>
     <div class=\"row\">
       <label>ย้อนหลัง
         <select id=\"hours\">
@@ -1755,9 +1754,9 @@ select{background:#0a1728;color:white;border:1px solid #36506c;padding:9px;borde
       </label>
     </div>
     <div class=\"row\">
-      <button onclick=\"makeGif('P.1')\">GIF P.1</button>
-      <button onclick=\"makeGif('P.67')\">GIF P.67</button>
-      <button class=\"alt\" onclick=\"makeCombined()\">GIF เปรียบเทียบ P.1 + P.67</button>
+      <button onclick=\"makeGif('P.1')\">P.1</button>
+      <button onclick=\"makeGif('P.67')\">P.67</button>
+      <button class=\"alt\" onclick=\"makeCombined()\">P.1 + P.67</button>
       <button class=\"alt\" onclick=\"checkHistory()\">ตรวจไฟล์ Playback</button>
     </div>
     <div class=\"progress-wrap\"><div class=\"progress-bar\" id=\"workProgressBar\"></div></div>
