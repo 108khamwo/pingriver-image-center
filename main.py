@@ -64,7 +64,7 @@ def make_session():
     )
     s.mount("https://", HTTPAdapter(max_retries=retry))
     s.headers.update({
-        "User-Agent": "Mozilla/5.0 (CCTVPingRiver/33.0)",
+        "User-Agent": "Mozilla/5.0 (CCTVPingRiver/34.0)",
         "Accept": "*/*",
         "Referer": "https://appserv.net/pingriver.php",
     })
@@ -1692,8 +1692,8 @@ HTML = """
 <html lang=\"th\">
 <head>
 <meta charset=\"utf-8\">
-<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">
-<title>CCTV Ping River v33</title>
+<meta name=\"viewport\" content=\"width=device-width,initial-scale=1,viewport-fit=cover\">
+<title>CCTV Ping River v34</title>
 <style>
 :root{color-scheme:dark}
 *{box-sizing:border-box}
@@ -1718,11 +1718,38 @@ label{color:#eafaff}
 .progress-wrap{margin-top:10px;background:#051828;border:1px solid #0b5f7c;border-radius:999px;overflow:hidden;height:14px}
 .progress-bar{height:100%;width:0%;background:#00c0fa;transition:width .25s ease}
 .muted{color:#bfe7f4;font-size:13px;margin-top:8px}
+
+@media (max-width:680px){
+  .wrap{
+    padding-top:max(14px,env(safe-area-inset-top));
+    padding-right:max(12px,env(safe-area-inset-right));
+    padding-bottom:max(18px,env(safe-area-inset-bottom));
+    padding-left:max(12px,env(safe-area-inset-left));
+  }
+  h1{font-size:30px;line-height:1.15;margin-bottom:14px}
+  h2{font-size:21px;line-height:1.25}
+  .grid{grid-template-columns:1fr;gap:14px}
+  .card{padding:14px;border-radius:15px}
+  .preview{width:100%;border-radius:12px}
+  .row{gap:9px}
+  button,a.btn{
+    min-height:44px;
+    padding:11px 14px;
+    font-size:16px;
+    -webkit-tap-highlight-color:transparent;
+  }
+  .tools .row label{flex:1 1 140px}
+  .tools select{width:100%;min-height:44px;font-size:16px}
+  .big{font-size:27px}
+  .status{font-size:13px;overflow-wrap:anywhere}
+  .progress-wrap{height:12px}
+}
+
 </style>
 </head>
 <body>
 <div class=\"wrap\">
-  <h1>🌊 CCTV Ping River v33</h1>
+  <h1>🌊 CCTV Ping River v34</h1>
   
   <div class=\"grid\">
     <section class=\"card\" data-station=\"P.67\">
@@ -1731,7 +1758,7 @@ label{color:#eafaff}
       <div class=\"big\" id=\"level-P67\">กำลังอ่านระดับน้ำ…</div>
       <div class=\"status\" id=\"status-P67\"></div>
       <div class=\"row\">
-        <button class=\"btn\" onclick=\"saveLatest('P.67')\">รูป CCTV ล่าสุด</button>
+        <button class=\"btn latest-action\" data-station=\"P.67\" onclick=\"saveLatest('P.67')\">รูป CCTV ล่าสุด</button>
         <button class=\"alt\" onclick=\"refreshCamera('P.67')\">รีเฟรช CCTV</button>
       </div>
     </section>
@@ -1742,7 +1769,7 @@ label{color:#eafaff}
       <div class=\"big\" id=\"level-P1\">กำลังอ่านระดับน้ำ…</div>
       <div class=\"status\" id=\"status-P1\"></div>
       <div class=\"row\">
-        <button class=\"btn\" onclick=\"saveLatest('P.1')\">รูป CCTV ล่าสุด</button>
+        <button class=\"btn latest-action\" data-station=\"P.1\" onclick=\"saveLatest('P.1')\">รูป CCTV ล่าสุด</button>
         <button class=\"alt\" onclick=\"refreshCamera('P.1')\">รีเฟรช CCTV</button>
       </div>
     </section>
@@ -1780,11 +1807,93 @@ label{color:#eafaff}
     </div>
     <div class=\"progress-wrap\"><div class=\"progress-bar\" id=\"workProgressBar\"></div></div>
     <div class=\"muted\" id=\"workProgressText\">พร้อมสร้าง GIF</div>
+    <div class=\"row\" id=\"shareResultRow\" style=\"display:none\"><button class=\"btn\" id=\"shareResultBtn\" onclick=\"sharePendingResult()\">แชร์ไฟล์</button></div>
   </section>
 </div>
 <script>
 const id = s => s.replace('.','');
 let currentJobPoll = null;
+
+const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent)
+  || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+
+const latestShareFiles = {};
+let pendingJobShare = null;
+
+function filenameFromDisposition(cd, fallback){
+  const m = (cd || '').match(/filename="?([^";]+)"?/i);
+  return (m && m[1]) ? m[1] : fallback;
+}
+
+function canShareFile(file){
+  try{
+    return !!(navigator.share && navigator.canShare && navigator.canShare({files:[file]}));
+  }catch(e){
+    return false;
+  }
+}
+
+function downloadFileObject(file){
+  const url = URL.createObjectURL(file);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = file.name || 'download';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(()=>URL.revokeObjectURL(url),1000);
+}
+
+async function preloadLatestShare(station){
+  try{
+    const r = await fetch('/download/jpg?station='+encodeURIComponent(station)+'&share=1');
+    if(!r.ok) return false;
+    const blob = await r.blob();
+    const filename = filenameFromDisposition(
+      r.headers.get('Content-Disposition'),
+      `${station.replace('.', '')}_latest.jpg`
+    );
+    latestShareFiles[station] = new File(
+      [blob],
+      filename,
+      {type: blob.type || 'image/jpeg'}
+    );
+    return true;
+  }catch(e){
+    return false;
+  }
+}
+
+async function sharePendingResult(){
+  if(!pendingJobShare) return;
+
+  const file = pendingJobShare.file;
+  if(canShareFile(file)){
+    try{
+      await navigator.share({
+        files:[file],
+        title:pendingJobShare.title || 'CCTV Ping River'
+      });
+      setWorkProgress(100,'แชร์ไฟล์แล้ว');
+      return;
+    }catch(e){
+      if(e && e.name === 'AbortError') return;
+    }
+  }
+  downloadFileObject(file);
+}
+
+function setupIOSUI(){
+  if(!isIOS) return;
+
+  document.querySelectorAll('.latest-action').forEach(btn=>{
+    btn.textContent = 'แชร์รูป CCTV ล่าสุด';
+  });
+
+  preloadLatestShare('P.67');
+  preloadLatestShare('P.1');
+}
+
 
 function setWorkProgress(percent, message){
   const bar=document.getElementById('workProgressBar');
@@ -1812,9 +1921,11 @@ function refreshCamera(station){
   const img=card.querySelector('img');
   const status=document.getElementById('status-'+id(station));
   status.textContent='กำลังรีเฟรชภาพ CCTV...';
+  delete latestShareFiles[station];
   img.onload = () => {
     status.textContent='รีเฟรชภาพ CCTV สำเร็จ';
     loadStatus(station);
+    if(isIOS) preloadLatestShare(station);
   };
   img.onerror = () => {
     status.textContent='รีเฟรชภาพ CCTV ไม่สำเร็จ';
@@ -1823,7 +1934,39 @@ function refreshCamera(station){
 }
 async function saveLatest(station){
   const status=document.getElementById('status-'+id(station));
-  status.textContent='กำลังสร้างและบันทึกภาพล่าสุด...';
+
+  if(isIOS){
+    const cached = latestShareFiles[station];
+    if(cached && canShareFile(cached)){
+      try{
+        await navigator.share({
+          files:[cached],
+          title:`CCTV ${station}`
+        });
+        status.textContent='แชร์รูปแล้ว';
+        // เตรียมไฟล์ใหม่เผื่อกดอีกครั้ง
+        delete latestShareFiles[station];
+        preloadLatestShare(station);
+        return;
+      }catch(e){
+        if(e && e.name === 'AbortError'){
+          status.textContent='ยกเลิกการแชร์';
+          return;
+        }
+      }
+    }
+
+    status.textContent='กำลังเตรียมรูปสำหรับแชร์...';
+    const ok = await preloadLatestShare(station);
+    if(ok){
+      status.textContent='พร้อมแล้ว แตะ “แชร์รูป CCTV ล่าสุด” อีกครั้ง';
+    }else{
+      status.textContent='เตรียมรูปสำหรับแชร์ไม่สำเร็จ';
+    }
+    return;
+  }
+
+  status.textContent='กำลังบันทึกภาพล่าสุด...';
   try{
     const r = await fetch('/download/jpg?station='+encodeURIComponent(station));
     if(!r.ok){
@@ -1831,24 +1974,21 @@ async function saveLatest(station){
       throw new Error(txt || 'download failed');
     }
     const blob = await r.blob();
-    const cd = r.headers.get('Content-Disposition') || '';
-    let filename = `${station.replace('.', '')}_latest.jpg`;
-    const m = cd.match(/filename="?([^";]+)"?/i);
-    if(m && m[1]) filename = m[1];
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = filename;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    URL.revokeObjectURL(url);
+    const filename = filenameFromDisposition(
+      r.headers.get('Content-Disposition'),
+      `${station.replace('.', '')}_latest.jpg`
+    );
+    const file = new File([blob], filename, {type:blob.type || 'image/jpeg'});
+    downloadFileObject(file);
     status.textContent='บันทึกภาพล่าสุดสำเร็จ';
   }catch(e){
     status.textContent='บันทึกภาพล่าสุดไม่สำเร็จ: ' + e.message;
   }
 }
+
 async function startJob(url){
+  pendingJobShare = null;
+  document.getElementById('shareResultRow').style.display='none';
   if(currentJobPoll){
     clearInterval(currentJobPoll);
     currentJobPoll=null;
@@ -1886,8 +2026,31 @@ async function pollJob(jobId){
       if(j.status === 'done'){
         clearInterval(currentJobPoll);
         currentJobPoll = null;
-        setWorkProgress(100, 'เสร็จแล้ว กำลังดาวน์โหลดไฟล์...');
-        window.location.href = `/api/job-download?job_id=${encodeURIComponent(jobId)}`;
+
+        if(isIOS){
+          setWorkProgress(100, 'เสร็จแล้ว กำลังเตรียมไฟล์สำหรับแชร์...');
+          try{
+            const fr = await fetch(`/api/job-download?job_id=${encodeURIComponent(jobId)}`);
+            if(!fr.ok) throw new Error('โหลดไฟล์ผลลัพธ์ไม่สำเร็จ');
+            const blob = await fr.blob();
+            const filename = filenameFromDisposition(
+              fr.headers.get('Content-Disposition'),
+              'CCTV_Ping_River.gif'
+            );
+            pendingJobShare = {
+              file:new File([blob],filename,{type:blob.type || 'image/gif'}),
+              title:'CCTV Ping River'
+            };
+            document.getElementById('shareResultRow').style.display='flex';
+            document.getElementById('shareResultBtn').textContent='แชร์ไฟล์ .GIF';
+            setWorkProgress(100,'เสร็จแล้ว แตะ “แชร์ไฟล์ .GIF”');
+          }catch(e){
+            setWorkProgress(100,'สร้างเสร็จแล้ว แต่เตรียมแชร์ไม่สำเร็จ');
+          }
+        }else{
+          setWorkProgress(100, 'เสร็จแล้ว กำลังดาวน์โหลดไฟล์...');
+          window.location.href = `/api/job-download?job_id=${encodeURIComponent(jobId)}`;
+        }
       }else if(j.status === 'error'){
         clearInterval(currentJobPoll);
         currentJobPoll = null;
@@ -1912,7 +2075,7 @@ async function checkHistory(){
     el.textContent=`P.1: ${a.in_period}/${a.total_files} ไฟล์ชั่วโมง | P.67: ${b.in_period}/${b.total_files} ไฟล์ชั่วโมง`;
   }catch(e){el.textContent='ตรวจไม่สำเร็จ: '+e.message}
 }
-loadStatus('P.1'); loadStatus('P.67');
+loadStatus('P.1'); loadStatus('P.67'); setupIOSUI();
 </script>
 </body>
 </html>
