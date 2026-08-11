@@ -64,7 +64,7 @@ def make_session():
     )
     s.mount("https://", HTTPAdapter(max_retries=retry))
     s.headers.update({
-        "User-Agent": "Mozilla/5.0 (CCTVPingRiver/31.0)",
+        "User-Agent": "Mozilla/5.0 (CCTVPingRiver/33.0)",
         "Accept": "*/*",
         "Referer": "https://appserv.net/pingriver.php",
     })
@@ -962,7 +962,9 @@ def _time_to_datetime(hhmm: str):
     h, m = map(int, hhmm.split(":"))
     n = now_bkk()
     candidate = n.replace(hour=h % 24, minute=m, second=0, microsecond=0)
-    if candidate > n + timedelta(minutes=5):
+    # ถ้าเป็นเวลาที่อยู่ข้างหน้า ให้ถือว่าไม่ใช่ค่าปัจจุบันของวันนี้
+    # (latest_water_level จะกรองอีกชั้นหนึ่งไม่ให้ใช้ future bucket)
+    if candidate > n:
         candidate -= timedelta(days=1)
     return candidate
 
@@ -1079,16 +1081,27 @@ def build_period_text_from_cam(cam, slots=None):
         return build_overall_period_text(slots or [])
 
 
-def latest_water_level(history):
+def latest_water_level(history, ref_dt=None):
+    """
+    คืนค่าระดับน้ำล่าสุดที่เวลาไม่เกิน ref_dt (หรือเวลาปัจจุบันของไทย)
+    ถ้าค่ายังไม่อัปเดต ก็จะย้อนกลับไปใช้ชั่วโมงล่าสุดที่มีจริงก่อนหน้า
+    และจะไม่หยิบ bucket ของอนาคต เช่น 15:00 ตอนเวลาจริงยัง 14:xx
+    """
     if not history:
         return None, None
-    latest_dt, latest_level = max(history, key=lambda x: x[0])
+
+    ref_dt = (ref_dt or now_bkk()).astimezone(BKK)
+    valid = [(dt, level) for dt, level in history if dt.astimezone(BKK) <= ref_dt]
+    if not valid:
+        return None, None
+
+    latest_dt, latest_level = max(valid, key=lambda x: x[0])
     return latest_level, latest_dt.astimezone(BKK)
 
 
 def render_report_frame(cctv_bytes: bytes, station: str, captured_at: datetime, water_level, size: int, water_level_dt=None, fixed_period_text=None, zoom_timestamp=False):
     # ปรับโทนโดยรวมให้เป็นสีฟ้ามากขึ้น
-    canvas = Image.new("RGB", (size, size), (10, 32, 60))
+    canvas = Image.new("RGB", (size, size), (4, 26, 42))
     draw = ImageDraw.Draw(canvas)
 
     margin = int(size * 0.032)
@@ -1112,7 +1125,7 @@ def render_report_frame(cctv_bytes: bytes, station: str, captured_at: datetime, 
     draw.rounded_rectangle(
         (margin, margin, size - margin, margin + header_h),
         radius=int(size * 0.022),
-        fill=(29, 79, 135),
+        fill=(0, 112, 156),
     )
     title_w, title_h = text_size(draw, title_text, title_font)
     title_x = (size - title_w) // 2
@@ -1135,7 +1148,7 @@ def render_report_frame(cctv_bytes: bytes, station: str, captured_at: datetime, 
             (image_box_w, image_box_h),
             method=Image.Resampling.LANCZOS,
         )
-        image_panel = Image.new("RGB", (image_box_w, image_box_h), (16, 28, 44))
+        image_panel = Image.new("RGB", (image_box_w, image_box_h), (5, 23, 36))
         paste_x = (image_box_w - fitted.width) // 2
         paste_y = (image_box_h - fitted.height) // 2
         image_panel.paste(fitted, (paste_x, paste_y))
@@ -1194,7 +1207,7 @@ def render_report_frame(cctv_bytes: bytes, station: str, captured_at: datetime, 
     draw.rounded_rectangle(
         (margin, y1, size - margin, y2),
         radius=int(size * 0.022),
-        fill=(21, 54, 95),
+        fill=(8, 71, 110),
     )
 
     inner_pad_x = int(size * 0.020)
@@ -1206,7 +1219,7 @@ def render_report_frame(cctv_bytes: bytes, station: str, captured_at: datetime, 
 
     # Separator
     sep_x = int(size * 0.505)
-    draw.line((sep_x, y1 + inner_pad_y, sep_x, y2 - inner_pad_y), fill=(52, 94, 144), width=2)
+    draw.line((sep_x, y1 + inner_pad_y, sep_x, y2 - inner_pad_y), fill=(0, 144, 188), width=2)
 
     level_text = "-" if water_level is None else f"{water_level:.2f} เมตร"
     level_time = (water_level_dt or captured_at.astimezone(BKK).replace(minute=0, second=0, microsecond=0)).astimezone(BKK)
@@ -1218,15 +1231,15 @@ def render_report_frame(cctv_bytes: bytes, station: str, captured_at: datetime, 
 
     # LEFT BLOCK: current water level + latest fixed hour
     left_w = sep_x - left_x - inner_pad_x
-    draw.text((left_x, top_y + int(content_h * 0.02)), "ระดับน้ำปัจจุบัน", font=label_font, fill=(190, 220, 252))
+    draw.text((left_x, top_y + int(content_h * 0.02)), "ระดับน้ำปัจจุบัน", font=label_font, fill=(195, 240, 255))
     draw.text((left_x, top_y + int(content_h * 0.30)), level_text, font=value_font, fill="white")
 
     left_time_font = fit_font_to_width(draw, current_dt_text, max_width=left_w, start_size=max(17, int(size * 0.028)), bold=False, min_size=13)
-    draw.text((left_x, top_y + int(content_h * 0.70)), current_dt_text, font=left_time_font, fill=(216, 228, 240))
+    draw.text((left_x, top_y + int(content_h * 0.70)), current_dt_text, font=left_time_font, fill=(232, 247, 255))
 
     # RIGHT BLOCK: overall CCTV range (fixed for the whole GIF when provided)
     right_w = size - margin - right_x - inner_pad_x
-    draw.text((right_x, top_y + int(content_h * 0.02)), "CCTV", font=label_font, fill=(190, 220, 252))
+    draw.text((right_x, top_y + int(content_h * 0.02)), "CCTV", font=label_font, fill=(195, 240, 255))
 
     period_font = fit_font_to_width(draw, period_text, max_width=right_w, start_size=max(17, int(size * 0.027)), bold=False, min_size=12)
     period_lines = wrap_text_to_width(draw, period_text, period_font, max_width=right_w, max_lines=2)
@@ -1238,18 +1251,22 @@ def render_report_frame(cctv_bytes: bytes, station: str, captured_at: datetime, 
     source_text = "ระบบโทรมาตร กรมชลประทาน"
     source_font = fit_font_to_width(draw, source_text, max_width=right_w, start_size=max(14, int(size * 0.022)), bold=False, min_size=11)
     source_y = y2 - inner_pad_y - text_size(draw, "Ag", source_font)[1]
-    draw.text((right_x, source_y), source_text, font=source_font, fill=(193, 210, 229))
+    draw.text((right_x, source_y), source_text, font=source_font, fill=(219, 241, 250))
 
     return canvas
 
 def latest_png(station: str):
     """
     คงชื่อฟังก์ชันเดิมไว้ แต่ผลลัพธ์เป็น JPG ตามการใช้งานล่าสุด
+    ระดับน้ำและเวลาใต้ภาพจะอ้างอิงค่าปัจจุบันล่าสุดจริง
+    ถ้ายังไม่อัปเดต ก็ใช้ค่าล่าสุดก่อนหน้า
     """
     url, _ = latest_cache_jpg(station)
     dt = camera_timestamp_from_cache_url(url) or now_bkk()
     history, _ = fetch_water_history(station)
-    level, level_dt = hourly_water_level(history, dt)
+    level, level_dt = latest_water_level(history, now_bkk())
+    if level_dt is None:
+        level, level_dt = hourly_water_level(history, dt)
     b = fetch_bytes(url + f"?t={int(now_bkk().timestamp())}")
     img = render_report_frame(b, station, dt, level, PNG_SIZE, water_level_dt=level_dt).convert("RGB")
     path = temp_path(".jpg")
@@ -1497,7 +1514,7 @@ def build_gif(station: str, hours: int, step: int, progress_cb=None):
     total_results = max(1, len(results))
     slots_only = [slot for slot, _ in results]
     fixed_period_text = build_period_text_from_cam(cam, slots_only)
-    fixed_level, fixed_level_dt = latest_water_level(history)
+    fixed_level, fixed_level_dt = latest_water_level(history, now_bkk())
     if fixed_level_dt is None:
         latest_slot_hour = max(slots_only).astimezone(BKK).replace(minute=0, second=0, microsecond=0)
         fixed_level = nearest_water_level(history, latest_slot_hour)
@@ -1589,8 +1606,8 @@ def build_combined_gif(hours: int, step: int, progress_cb=None):
         fixed_period_text = f"{period_start.astimezone(BKK).strftime('%d/%m/%Y %H:%M')} - {period_end.astimezone(BKK).strftime('%d/%m/%Y %H:%M')} น."
     except Exception:
         fixed_period_text = build_overall_period_text(common_slots)
-    fixed_left_level, fixed_left_dt = latest_water_level(h1)
-    fixed_right_level, fixed_right_dt = latest_water_level(h67)
+    fixed_left_level, fixed_left_dt = latest_water_level(h1, now_bkk())
+    fixed_right_level, fixed_right_dt = latest_water_level(h67, now_bkk())
     if fixed_left_dt is None:
         fixed_left_dt = max(common_slots).astimezone(BKK).replace(minute=0, second=0, microsecond=0)
         fixed_left_level = nearest_water_level(h1, fixed_left_dt)
@@ -1676,34 +1693,36 @@ HTML = """
 <head>
 <meta charset=\"utf-8\">
 <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">
-<title>CCTV Ping River v31</title>
+<title>CCTV Ping River v33</title>
 <style>
 :root{color-scheme:dark}
 *{box-sizing:border-box}
-body{margin:0;font-family:system-ui,-apple-system,\"Noto Sans Thai\",sans-serif;background:#07111f;color:#eef5ff}
+body{margin:0;font-family:system-ui,-apple-system,"Noto Sans Thai",sans-serif;background:#041521;color:#f4fcff}
 .wrap{max-width:1120px;margin:auto;padding:24px}
-h1{font-size:clamp(26px,4vw,44px);margin:0 0 6px}
-.sub{color:#99acc4;margin-bottom:24px}
+h1{font-size:clamp(26px,4vw,44px);margin:0 0 6px;color:#f7fdff}
+h2{color:#f3fbff}
+.sub{color:#b6e7f6;margin-bottom:24px}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:18px}
-.card{background:#0e2038;border:1px solid #203a5c;border-radius:18px;padding:18px;box-shadow:0 16px 40px #0005}
-.preview{aspect-ratio:16/9;background:#06101d;border-radius:14px;overflow:hidden;display:flex;align-items:center;justify-content:center}
+.card{background:#07263a;border:1px solid #0b6f92;border-radius:18px;padding:18px;box-shadow:0 16px 40px #0006}
+.preview{aspect-ratio:16/9;background:#03121c;border-radius:14px;overflow:hidden;display:flex;align-items:center;justify-content:center;border:1px solid #0b5b77}
 .preview img{width:100%;height:100%;object-fit:cover}
 .row{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
-button,a.btn{border:0;border-radius:10px;padding:10px 14px;background:#2373d8;color:white;text-decoration:none;cursor:pointer;font-weight:700}
-button.alt,a.alt{background:#244260}
-select{background:#0a1728;color:white;border:1px solid #36506c;padding:9px;border-radius:9px}
-.status{font-size:14px;color:#a9bad0;min-height:22px;margin-top:8px}
-.big{font-size:28px;font-weight:800;margin:9px 0}
+button,a.btn{border:0;border-radius:10px;padding:10px 14px;background:#00c0fa;color:#052034;text-decoration:none;cursor:pointer;font-weight:800}
+button.alt,a.alt{background:#0b5f7c;color:#ecfbff}
+select{background:#072034;color:#f4fcff;border:1px solid #0d8db7;padding:9px;border-radius:9px}
+label{color:#eafaff}
+.status{font-size:14px;color:#cceffc;min-height:22px;margin-top:8px}
+.big{font-size:28px;font-weight:800;margin:9px 0;color:#f8fdff}
 .tools{margin-top:18px}
-.note{margin-top:20px;padding:14px;border-radius:12px;background:#102a44;color:#bcd0e5}
-.progress-wrap{margin-top:10px;background:#0a1728;border:1px solid #284664;border-radius:999px;overflow:hidden;height:14px}
-.progress-bar{height:100%;width:0%;background:#2f86ff;transition:width .25s ease}
-.muted{color:#8ea6c5;font-size:13px;margin-top:8px}
+.note{margin-top:20px;padding:14px;border-radius:12px;background:#093149;color:#d8f4ff}
+.progress-wrap{margin-top:10px;background:#051828;border:1px solid #0b5f7c;border-radius:999px;overflow:hidden;height:14px}
+.progress-bar{height:100%;width:0%;background:#00c0fa;transition:width .25s ease}
+.muted{color:#bfe7f4;font-size:13px;margin-top:8px}
 </style>
 </head>
 <body>
 <div class=\"wrap\">
-  <h1>🌊 CCTV Ping River v31</h1>
+  <h1>🌊 CCTV Ping River v33</h1>
   
   <div class=\"grid\">
     <section class=\"card\" data-station=\"P.67\">
