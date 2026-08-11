@@ -136,25 +136,52 @@ def parse_hourly_filename(name: str):
         return None
 
 
-def latest_cache_jpg(station: str):
-    raw = fetch_text(f"{APP_BASE}?op=camlist&station={station}&_={int(now_bkk().timestamp()*1000)}")
-    urls = re.findall(
-        rf'((?:https?://appserv\.net)?/cache/{re.escape(station)}/[^"\'<>\s\\]+?\.jpe?g(?:\?[^"\'<>\s\\]*)?)',
-        raw,
-        re.I
-    )
+def _extract_cache_jpgs(raw: str, station: str):
+    pattern = rf"((?:https?://appserv\.net)?/cache/{re.escape(station)}/[^\s\"'<>]+?\.jpe?g(?:\?[^\s\"'<>]*)?)"
+    urls = re.findall(pattern, raw, re.I)
+
+    try:
+        soup = BeautifulSoup(raw, "html.parser")
+        for tag in soup.find_all(["img", "a", "source"]):
+            for attr in ("src", "href"):
+                value = tag.get(attr)
+                if value and f"/cache/{station}/" in value and re.search(r"\.jpe?g(?:\?|$)", value, re.I):
+                    urls.append(value)
+    except Exception:
+        pass
+
     clean = []
     for u in urls:
-        u = u.replace("\\/", "/").replace("&amp;", "&")
+        u = u.replace("\\/", "/").replace("&amp;", "&").strip()
         if u.startswith("/"):
             u = APP_ORIGIN + u
         clean.append(u.split("?")[0])
+
     clean = list(dict.fromkeys(clean))
-    clean.sort(key=lambda x: camera_timestamp_from_cache_url(x) or datetime(2000, 1, 1, tzinfo=BKK))
+    clean.sort(
+        key=lambda x: camera_timestamp_from_cache_url(x)
+        or datetime(2000, 1, 1, tzinfo=BKK)
+    )
+    return clean
+
+
+def latest_cache_jpg(station: str):
+    # camlist รุ่นปัจจุบันเน้นคืนรายชื่อ MP4 จึงอาจไม่มี JPG ล่าสุด
+    raw = fetch_text(
+        f"{APP_BASE}?op=camlist&station={station}&_={int(now_bkk().timestamp()*1000)}"
+    )
+    clean = _extract_cache_jpgs(raw, station)
+
+    # fallback เหมือน v1: อ่านหน้า station เพื่อหา <img src="/cache/P.x/...jpg">
+    if not clean:
+        page = fetch_text(
+            f"{APP_BASE}?station={station}&_={int(now_bkk().timestamp()*1000)}"
+        )
+        clean = _extract_cache_jpgs(page, station)
+
     if not clean:
         raise RuntimeError(f"ไม่พบภาพล่าสุดของ {station}")
     return clean[-1], clean
-
 
 def parse_camlist_response(raw: str):
     obj = None
@@ -700,23 +727,46 @@ def health():
 @app.get("/api/status")
 def api_status(station: str = Query(...)):
     station = validate_station(station)
+
+    latest_url = None
+    latest_dt = None
+    level = None
+    playback_count = 0
+    exp = None
+    sig_present = False
+    errors = {}
+
     try:
         latest_url, _ = latest_cache_jpg(station)
         latest_dt = camera_timestamp_from_cache_url(latest_url)
+    except Exception as e:
+        errors["latest_camera"] = str(e)
+
+    try:
         history, _ = fetch_water_history(station)
         level = nearest_water_level(history, latest_dt or now_bkk())
-        cam = fetch_camlist(station)
-        return {
-            "station": station,
-            "name": STATIONS[station],
-            "water_level": level,
-            "camera_time": latest_dt.strftime("%d/%m/%Y %H:%M:%S") if latest_dt else None,
-            "playback_count": len(cam["files"]),
-            "exp": cam.get("exp"),
-            "sig_present": bool(cam.get("sig")),
-        }
     except Exception as e:
-        raise HTTPException(502, f"ดึงข้อมูลต้นทางไม่สำเร็จ: {e}")
+        errors["water_level"] = str(e)
+
+    try:
+        cam = fetch_camlist(station)
+        playback_count = len(cam["files"])
+        exp = cam.get("exp")
+        sig_present = bool(cam.get("sig"))
+    except Exception as e:
+        errors["playback"] = str(e)
+
+    return {
+        "station": station,
+        "name": STATIONS[station],
+        "water_level": level,
+        "camera_time": latest_dt.strftime("%d/%m/%Y %H:%M:%S") if latest_dt else None,
+        "latest_camera_ok": bool(latest_url),
+        "playback_count": playback_count,
+        "exp": exp,
+        "sig_present": sig_present,
+        "errors": errors,
+    }
 
 
 @app.get("/api/history-check")
@@ -760,6 +810,24 @@ def debug_camlist(station: str = Query(...)):
         }
     except Exception as e:
         raise HTTPException(502, str(e))
+
+
+@app.get("/api/debug/latest")
+def debug_latest(station: str = Query(...)):
+    station = validate_station(station)
+    out = {"station": station}
+    try:
+        url, urls = latest_cache_jpg(station)
+        dt = camera_timestamp_from_cache_url(url)
+        out.update({
+            "ok": True,
+            "latest_url": url,
+            "count": len(urls),
+            "camera_time": dt.isoformat() if dt else None,
+        })
+    except Exception as e:
+        out.update({"ok": False, "error": str(e)})
+    return out
 
 
 @app.get("/camera/latest")

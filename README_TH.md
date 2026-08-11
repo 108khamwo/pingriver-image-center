@@ -1,4 +1,4 @@
-# Ping River Image Center v2
+# Ping River Image Center v3
 
 เวอร์ชันนี้อัปเดตให้ใช้ CCTV Playback แบบวิดีโอรายชั่วโมง (`hourly/*.mp4`) เพื่อสร้าง GIF จากภาพจริงย้อนหลัง
 
@@ -26,3 +26,10 @@
 ## หมายเหตุ
 ถ้า playback ของ AppServ ต้องใช้ signed URL (`exp` / `sig`) แต่ backend หาไม่เจอ GIF อาจยังสร้างไม่ได้
 ในกรณีนั้นให้เปิด `/api/debug/camlist?station=P.67` แล้วส่งผลกลับมาเพื่อปรับ parser ต่อ
+
+
+## แก้ไข v3
+- แก้ 502 ที่ `/api/status` และ `/camera/latest`
+- ถ้า camlist ไม่มี JPG ล่าสุด จะ fallback ไปอ่านหน้า `pingriver.php?station=P.x`
+- Playback error จะไม่ทำให้ status ทั้งหมดล้ม
+- เพิ่ม `/api/debug/latest?station=P.67`
