@@ -64,7 +64,7 @@ def make_session():
     )
     s.mount("https://", HTTPAdapter(max_retries=retry))
     s.headers.update({
-        "User-Agent": "Mozilla/5.0 (PingRiverImageCenter/16.0)",
+        "User-Agent": "Mozilla/5.0 (PingRiverImageCenter/17.0)",
         "Accept": "*/*",
         "Referer": "https://appserv.net/pingriver.php",
     })
@@ -1035,10 +1035,21 @@ def nearest_water_level(history, dt):
 
 def hourly_water_level(history, dt):
     """
-    ใช้ค่าระดับน้ำตามชั่วโมงเต็ม และคืนทั้งค่า + เวลาที่ใช้แสดงผล
+    ใช้ค่าระดับน้ำตามชั่วโมงเต็มสำหรับภาพล่าสุด/PNG
     """
     hour_dt = dt.astimezone(BKK).replace(minute=0, second=0, microsecond=0)
     return nearest_water_level(history, hour_dt), hour_dt
+
+
+def playback_hour_water_level(history, slot_dt):
+    """
+    สำหรับ GIF playback ให้แสดงค่าระดับน้ำของ "ชั่วโมงปัจจุบัน" ของคลิป
+    เช่นคลิปช่วง 11:00-12:00 ให้โชว์ค่าชั่วโมง 12:00
+    เพื่อไม่ให้ข้อมูลช้ากว่าช่วงเวลาในคลิป 1 ชั่วโมง
+    """
+    start_hour = slot_dt.astimezone(BKK).replace(minute=0, second=0, microsecond=0)
+    display_dt = start_hour + timedelta(hours=1)
+    return nearest_water_level(history, display_dt), display_dt
 
 
 def render_report_frame(cctv_bytes: bytes, station: str, captured_at: datetime, water_level, size: int, water_level_dt=None):
@@ -1362,7 +1373,7 @@ def build_gif(station: str, hours: int, step: int, progress_cb=None):
     frames = []
     total_results = max(1, len(results))
     for idx, (slot, b) in enumerate(results, start=1):
-        level, level_dt = hourly_water_level(history, slot)
+        level, level_dt = playback_hour_water_level(history, slot)
         fr = render_report_frame(b, station, slot, level, GIF_SIZE, water_level_dt=level_dt)
         fr = fr.quantize(colors=128, method=Image.Quantize.MEDIANCUT)
         frames.append(fr)
@@ -1435,8 +1446,8 @@ def build_combined_gif(hours: int, step: int, progress_cb=None):
         if slot not in bytes1 or slot not in bytes67:
             continue
 
-        left_level, left_level_dt = hourly_water_level(h1, slot)
-        right_level, right_level_dt = hourly_water_level(h67, slot)
+        left_level, left_level_dt = playback_hour_water_level(h1, slot)
+        right_level, right_level_dt = playback_hour_water_level(h67, slot)
         left = render_report_frame(
             bytes1[slot],
             "P.1",
@@ -1510,7 +1521,7 @@ HTML = """
 <head>
 <meta charset=\"utf-8\">
 <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">
-<title>Ping River Image Center v16</title>
+<title>Ping River Image Center v17</title>
 <style>
 :root{color-scheme:dark}
 *{box-sizing:border-box}
@@ -1537,7 +1548,7 @@ select{background:#0a1728;color:white;border:1px solid #36506c;padding:9px;borde
 </head>
 <body>
 <div class=\"wrap\">
-  <h1>🌊 Ping River Image Center v16</h1>
+  <h1>🌊 Ping River Image Center v17</h1>
   <div class=\"sub\">เวอร์ชันนี้ใช้ CCTV Playback แบบวิดีโอรายชั่วโมงเพื่อสร้าง GIF จากภาพจริงย้อนหลัง</div>
 
   <div class=\"grid\">
