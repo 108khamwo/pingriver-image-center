@@ -58,7 +58,7 @@ def make_session():
     )
     s.mount("https://", HTTPAdapter(max_retries=retry))
     s.headers.update({
-        "User-Agent": "Mozilla/5.0 (PingRiverImageCenter/6.0)",
+        "User-Agent": "Mozilla/5.0 (PingRiverImageCenter/7.0)",
         "Accept": "*/*",
         "Referer": "https://appserv.net/pingriver.php",
     })
@@ -487,56 +487,87 @@ def playback_url_candidates(station: str, rel_file: str, exp=None, sig=None):
     return urls
 
 
-def _ffmpeg_http_headers():
-    headers = [
-        "Referer: https://appserv.net/pingriver.php",
-        "Origin: https://appserv.net",
-        "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36",
-    ]
-    if HTTP.cookies:
-        cookie_text = "; ".join(f"{c.name}={c.value}" for c in HTTP.cookies)
-        if cookie_text:
-            headers.append("Cookie: " + cookie_text)
-    return "\r\n".join(headers) + "\r\n"
+def _playback_request_headers(station: str):
+    headers = {
+        "Referer": f"{APP_BASE}?station={station}",
+        "Origin": "https://appserv.net",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36",
+        "Accept": "*/*",
+    }
+    return headers
 
 
-def ffmpeg_extract_frame(urls, offset_seconds: int):
+def download_playback_video(urls, station: str):
     """
-    ใช้ signed URL จาก camlist และส่ง Referer/Origin/Cookie แบบ browser
+    v7: ไม่ให้ ffmpeg ยิง URL ตรง ๆ แล้ว
+    เพราะ ffmpeg client มักโดน 403 แม้ signed URL จะถูกต้อง
+    ใช้ requests.Session เดิมดาวน์โหลด mp4 ก่อน แล้วค่อยให้ ffmpeg อ่านไฟล์ local
     """
     last_err = None
-    http_headers = _ffmpeg_http_headers()
+    tried = []
+    headers = _playback_request_headers(station)
 
     for url in urls:
-        cmd = [
-            "ffmpeg",
-            "-hide_banner",
-            "-loglevel", "error",
-            "-y",
-            "-user_agent",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36",
-            "-headers", http_headers,
-            "-ss", str(int(offset_seconds)),
-            "-i", url,
-            "-frames:v", "1",
-            "-f", "image2pipe",
-            "-vcodec", "mjpeg",
-            "pipe:1",
-        ]
         try:
-            res = subprocess.run(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=120,
-            )
-            if res.returncode == 0 and res.stdout:
-                return res.stdout
-            last_err = res.stderr.decode("utf-8", "ignore")[:800]
-        except Exception as e:
-            last_err = str(e)
+            resp = HTTP.get(url, headers=headers, stream=True, timeout=HTTP_TIMEOUT, allow_redirects=True)
+            ct = resp.headers.get("content-type", "")
+            if resp.status_code != 200:
+                last_err = f"HTTP {resp.status_code} {url}"
+                tried.append(last_err)
+                continue
+            if "video" not in ct and "octet-stream" not in ct and "mp4" not in ct:
+                prefix = resp.raw.read(120)
+                last_err = f"unexpected content-type={ct!r} url={url} prefix={prefix!r}"
+                tried.append(last_err)
+                continue
 
-    raise RuntimeError(last_err or "ffmpeg ดึงเฟรมไม่สำเร็จ")
+            path = temp_path(".mp4")
+            with open(path, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=1024 * 256):
+                    if chunk:
+                        f.write(chunk)
+            return path
+
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {e}"
+            tried.append(last_err)
+
+    raise RuntimeError(" | ".join(tried[-4:]) if tried else (last_err or "download video failed"))
+
+
+def extract_frame_from_local_video(video_path: str, offset_seconds: int):
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel", "error",
+        "-y",
+        "-ss", str(int(offset_seconds)),
+        "-i", video_path,
+        "-frames:v", "1",
+        "-f", "image2pipe",
+        "-vcodec", "mjpeg",
+        "pipe:1",
+    ]
+    res = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=120,
+    )
+    if res.returncode == 0 and res.stdout:
+        return res.stdout
+    err = res.stderr.decode("utf-8", "ignore")[:800]
+    raise RuntimeError(err or "ffmpeg extract local frame failed")
+
+
+def ffmpeg_extract_frame(urls, offset_seconds: int, station: str):
+    video_path = None
+    try:
+        video_path = download_playback_video(urls, station)
+        return extract_frame_from_local_video(video_path, offset_seconds)
+    finally:
+        if video_path:
+            remove_file(video_path)
 
 def _parse_meter(cell: str):
     m = re.search(r'([+-]?\d+(?:\.\d+)?)\s*(?:m\b|เมตร)', cell, re.I)
@@ -737,6 +768,7 @@ def build_slot_tasks(station: str, hours: int, step: int):
         if rel:
             offset = int((cursor - hour_dt).total_seconds())
             tasks.append({
+                "station": station,
                 "slot": cursor,
                 "rel_file": rel,
                 "offset": offset,
@@ -755,7 +787,7 @@ def build_slot_tasks(station: str, hours: int, step: int):
 
 
 def extract_task_frame(task):
-    b = ffmpeg_extract_frame(task["urls"], task["offset"])
+    b = ffmpeg_extract_frame(task["urls"], task["offset"], task["station"])
     return task["slot"], b
 
 
@@ -854,7 +886,7 @@ HTML = """
 <head>
 <meta charset=\"utf-8\">
 <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">
-<title>Ping River Image Center v6</title>
+<title>Ping River Image Center v7</title>
 <style>
 :root{color-scheme:dark}
 *{box-sizing:border-box}
@@ -878,7 +910,7 @@ select{background:#0a1728;color:white;border:1px solid #36506c;padding:9px;borde
 </head>
 <body>
 <div class=\"wrap\">
-  <h1>🌊 Ping River Image Center v6</h1>
+  <h1>🌊 Ping River Image Center v7</h1>
   <div class=\"sub\">เวอร์ชันนี้ใช้ CCTV Playback แบบวิดีโอรายชั่วโมงเพื่อสร้าง GIF จากภาพจริงย้อนหลัง</div>
 
   <div class=\"grid\">
@@ -1070,6 +1102,20 @@ def history_check(station: str = Query(...), hours: int = Query(24, ge=1, le=72)
         }
     except Exception as e:
         raise HTTPException(502, f"ตรวจ playback ไม่สำเร็จ: {e}")
+
+
+@app.get("/api/debug/playback-url-sample")
+def api_debug_playback_url_sample(station: str = Query(...)):
+    station = validate_station(station)
+    tasks, cam = build_slot_tasks(station, hours=1, step=30)
+    sample_task = tasks[0] if tasks else None
+    return {
+        "station": station,
+        "auth_source": cam.get("auth_source"),
+        "has_exp": bool(cam.get("exp")),
+        "has_sig": bool(cam.get("sig")),
+        "sample_urls": (sample_task or {}).get("urls", []),
+    }
 
 
 @app.get("/api/debug/session-camlist")

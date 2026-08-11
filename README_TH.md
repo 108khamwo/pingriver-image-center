@@ -1,4 +1,4 @@
-# Ping River Image Center v6
+# Ping River Image Center v7
 
 เวอร์ชันนี้อัปเดตให้ใช้ CCTV Playback แบบวิดีโอรายชั่วโมง (`hourly/*.mp4`) เพื่อสร้าง GIF จากภาพจริงย้อนหลัง
 
@@ -65,3 +65,15 @@ v6 จึง:
 Debug:
 - `/api/debug/session-camlist?station=P.1`
 - `/api/debug/session-camlist?station=P.67`
+
+
+## แก้ไข v7 — ดาวน์โหลด MP4 ก่อนค่อยสกัดเฟรม
+จาก debug ของ v6 พบว่า camlist มี `exp/sig` แล้ว แต่ ffmpeg ยิง URL ตรง ๆ ยัง 403
+v7 จึงเปลี่ยนวิธี:
+1. ใช้ `requests.Session` เดิมดาวน์โหลด signed MP4 จาก AppServ/Playback
+2. บันทึกเป็นไฟล์ชั่วคราว local
+3. ใช้ ffmpeg อ่านไฟล์ local เพื่อสกัดเฟรม
+
+เพิ่ม debug:
+- `/api/debug/playback-url-sample?station=P.1`
+- `/api/debug/playback-url-sample?station=P.67`
